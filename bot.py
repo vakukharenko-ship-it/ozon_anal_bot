@@ -29,9 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-# ==================== ВЕРСИЯ ====================
-VERSION = "2.4.5"
-CHANGELOG_MESSAGE = "Возвращены: администрирование менеджеров, персональные рассылки для каждого пользователя, справка, напоминание о настройке в 12:00 МСК. Файлы настроек в /app/data/."
+VERSION = "2.4.9"
+CHANGELOG_MESSAGE = "Правильная логика рассылок: schedule_hours = обычные отчёты, yesterday_report_hours = с блоком Вчера. Раздельные last_sent."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -46,9 +45,9 @@ DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
 SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
+EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
-# Состояния
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
 WAITING_PERIOD_START = 3
@@ -99,8 +98,9 @@ _cache_lock = asyncio.Lock()
 _api_cache = {}
 _cache_timestamps = {}
 _settings_lock = asyncio.Lock()
+_expense_types_cache = None
+_expense_types_lock = asyncio.Lock()
 
-# ==================== КОНФИГ ====================
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
 OZON_PERFORMANCE_CLIENT_ID = os.getenv("OZON_PERFORMANCE_CLIENT_ID")
@@ -114,13 +114,17 @@ OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
-# ==================== СПРАВОЧНИКИ ====================
-TYPE_ID_NAMES = {1: "Обработка товара", 29: "Последняя миля", 32: "Логистика",
-                 98: "Доп. услуги отправления", 12: "Прочие услуги Ozon",
-                 76: "Внешние услуги Ozon"}
+DEFAULT_EXPENSE_TYPES = {
+    "1": "Обработка товара",
+    "12": "Прочие услуги Ozon",
+    "29": "Последняя миля",
+    "32": "Логистика",
+    "76": "Внешние услуги Ozon",
+    "98": "Доп. услуги отправления",
+}
+
 CATEGORY_FALLBACK = {"ITEM": "Услуги по товарам", "NON_ITEM": "Внешние услуги Ozon",
                      "POSTING": "Услуги отправления", "CONTAINER": "Контейнеры"}
-
 METRIC_LABELS = {
     "ordered_sum": "Заказано (₽)", "ordered_units": "Заказано (шт.)",
     "delivered_sum": "Доставлено (₽)", "delivered_units": "Доставлено (шт.)",
@@ -149,11 +153,9 @@ def validate_env_vars() -> bool:
            "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN, "ADMIN_CHAT_ID": ADMIN_CHAT_ID_STR}
     missing = [k for k, v in req.items() if not v]
     if missing:
-        write_log(f"❌ Missing env vars: {', '.join(missing)}")
-        return False
+        write_log(f"❌ Missing env vars: {', '.join(missing)}"); return False
     if not ADMIN_CHAT_ID_STR.isdigit():
-        write_log("❌ ADMIN_CHAT_ID должен быть числом")
-        return False
+        write_log("❌ ADMIN_CHAT_ID должен быть числом"); return False
     return True
 
 def update_version_history(version, message):
@@ -170,18 +172,86 @@ def update_version_history(version, message):
             write_log(f"⚠️ Чтение истории: {e}"); history = []
     for e in history:
         if e.get("version") == version:
-            write_log(f"ℹ️ Версия {version} уже в истории.")
-            return
+            write_log(f"ℹ️ Версия {version} уже в истории."); return
     now = datetime.datetime.now(MOSCOW_TZ).strftime("%Y-%m-%d %H:%M:%S")
     history.append({"version": version, "date": now, "message": message})
     try:
         with open(VERSION_HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history, f, ensure_ascii=False, indent=2)
-        write_log(f"✅ История: {version} (всего записей: {len(history)})")
+        write_log(f"✅ История: {version} (записей: {len(history)})")
     except Exception as e:
         write_log(f"❌ Запись истории: {e}")
 
-# ==================== PERSISTENT CACHE ====================
+# ==================== СПРАВОЧНИК РАСХОДОВ ====================
+def _init_expense_types_file():
+    if os.path.exists(EXPENSE_TYPES_FILE): return
+    try:
+        os.makedirs(os.path.dirname(EXPENSE_TYPES_FILE), exist_ok=True)
+        data = {tid: {"name": name, "count": 0, "sum": 0.0}
+                for tid, name in DEFAULT_EXPENSE_TYPES.items()}
+        with open(EXPENSE_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        write_log(f"✅ Создан справочник расходов: {EXPENSE_TYPES_FILE}")
+    except Exception as e:
+        write_log(f"❌ Ошибка создания справочника: {e}")
+
+def _load_expense_types_sync():
+    if not os.path.exists(EXPENSE_TYPES_FILE): return {}
+    try:
+        with open(EXPENSE_TYPES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        write_log(f"⚠️ Чтение справочника: {e}"); return {}
+
+def _save_expense_types_sync(data):
+    try:
+        os.makedirs(os.path.dirname(EXPENSE_TYPES_FILE), exist_ok=True)
+        with open(EXPENSE_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        write_log(f"❌ Запись справочника: {e}")
+
+def get_expense_types():
+    global _expense_types_cache
+    if _expense_types_cache is None:
+        _expense_types_cache = _load_expense_types_sync()
+    return _expense_types_cache
+
+def type_name(type_id, category_code):
+    if type_id is None:
+        return CATEGORY_FALLBACK.get(category_code, "Услуги")
+    tid = str(type_id)
+    data = get_expense_types()
+    if tid in data:
+        entry = data[tid]
+        if isinstance(entry, dict):
+            return entry.get("name", f"❓ Неизвестно (type {tid})")
+        return entry
+    fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
+    placeholder = f"{fallback} (type {tid})"
+    data[tid] = {"name": placeholder, "count": 0, "sum": 0.0}
+    _save_expense_types_sync(data)
+    write_log(f"🆕 Новый type_id: {tid} → {placeholder}")
+    return placeholder
+
+def register_expense_hit(type_id, amount):
+    if type_id is None: return
+    tid = str(type_id)
+    data = get_expense_types()
+    if tid not in data: return
+    entry = data[tid]
+    if not isinstance(entry, dict):
+        entry = {"name": entry, "count": 0, "sum": 0.0}
+        data[tid] = entry
+    entry["count"] = entry.get("count", 0) + 1
+    entry["sum"] = round(entry.get("sum", 0.0) + amount, 2)
+
+def flush_expense_types():
+    global _expense_types_cache
+    if _expense_types_cache is not None:
+        _save_expense_types_sync(_expense_types_cache)
+
+# ==================== DISK CACHE ====================
 def _disk_path(key):
     h = hashlib.md5(key.encode()).hexdigest()[:16]
     safe = re.sub(r'[^a-zA-Z0-9_-]', '_', key)[:40]
@@ -191,8 +261,7 @@ def disk_cache_get(key):
     path = _disk_path(key)
     if not os.path.exists(path): return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
+        with open(path, "r", encoding="utf-8") as f: return json.load(f)
     except: return None
 
 def disk_cache_set(key, value):
@@ -212,34 +281,31 @@ async def get_from_cache(key):
     val = disk_cache_get(key)
     if val is not None:
         async with _cache_lock:
-            _api_cache[key] = val
-            _cache_timestamps[key] = time.time()
+            _api_cache[key] = val; _cache_timestamps[key] = time.time()
         write_log(f"💾 Кэш-хит: {key[:50]}")
     return val
 
 async def save_to_cache(key, value):
     async with _cache_lock:
-        _api_cache[key] = value
-        _cache_timestamps[key] = time.time()
+        _api_cache[key] = value; _cache_timestamps[key] = time.time()
     disk_cache_set(key, value)
 
-# ==================== НАСТРОЙКИ И МЕНЕДЖЕРЫ ====================
+# ==================== НАСТРОЙКИ / МЕНЕДЖЕРЫ ====================
 def _ensure_data_dir():
     try:
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(DISK_CACHE_DIR, exist_ok=True)
     except Exception as e:
-        write_log(f"⚠️ Не удалось создать {DATA_DIR}: {e}")
+        write_log(f"⚠️ Создание {DATA_DIR}: {e}")
 
 async def load_settings() -> Dict:
-    """{chat_id_str: {schedule_hours, yesterday_report_hours, silence_start, silence_end, last_sent, last_reminder}}"""
     async with _settings_lock:
         if os.path.exists(SETTINGS_FILE):
             try:
                 with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                     return json.load(f)
             except Exception as e:
-                write_log(f"⚠️ Ошибка settings: {e}"); return {}
+                write_log(f"⚠️ settings: {e}"); return {}
         return {}
 
 async def save_settings(settings: Dict):
@@ -249,37 +315,40 @@ async def save_settings(settings: Dict):
             with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
                 json.dump(settings, f, ensure_ascii=False, indent=2)
         except Exception as e:
-            write_log(f"❌ Ошибка сохранения settings: {e}")
+            write_log(f"❌ settings: {e}")
 
 def get_user_settings(settings: Dict, chat_id: int) -> Dict:
+    """Возвращает настройки пользователя. Мигрирует старый last_sent → last_sent_regular."""
     sid = str(chat_id)
     if sid not in settings:
-        settings[sid] = {
-            "schedule_hours": [],
-            "yesterday_report_hours": [],
-            "silence_start": None,
-            "silence_end": None,
-            "last_sent": None,
-            "last_reminder": None,
-        }
-    return settings[sid]
+        settings[sid] = {"schedule_hours": [], "yesterday_report_hours": [],
+                         "silence_start": None, "silence_end": None,
+                         "last_sent_regular": None, "last_sent_yesterday": None,
+                         "last_reminder": None}
+    us = settings[sid]
+    # Миграция со старого формата
+    if "last_sent" in us:
+        us.setdefault("last_sent_regular", us.get("last_sent"))
+        us.setdefault("last_sent_yesterday", None)
+        us.pop("last_sent", None)
+    us.setdefault("last_sent_regular", None)
+    us.setdefault("last_sent_yesterday", None)
+    return us
 
 def user_has_schedule(chat_id: int) -> bool:
-    """Проверяет настроены ли рассылки (синхронно читает файл)."""
+    """Настроены ли рассылки. Достаточно schedule_hours."""
     if not os.path.exists(SETTINGS_FILE): return False
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
             s = json.load(f)
         us = s.get(str(chat_id), {})
-        return bool(us.get("schedule_hours")) and bool(us.get("yesterday_report_hours"))
-    except:
-        return False
+        return bool(us.get("schedule_hours"))
+    except: return False
 
 def load_managers():
     if os.path.exists(MANAGERS_FILE):
         try:
-            with open(MANAGERS_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(MANAGERS_FILE, "r", encoding="utf-8") as f: return json.load(f)
         except: return []
     return []
 
@@ -289,16 +358,11 @@ def save_managers(managers):
         with open(MANAGERS_FILE, "w", encoding="utf-8") as f:
             json.dump(managers, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        write_log(f"❌ Ошибка managers: {e}")
+        write_log(f"❌ managers: {e}")
 
-def is_manager(chat_id):
-    return any(m.get("id") == chat_id for m in load_managers())
-
-def is_admin(chat_id):
-    return chat_id == ADMIN_CHAT_ID
-
-def has_access(chat_id):
-    return is_admin(chat_id) or is_manager(chat_id)
+def is_manager(chat_id): return any(m.get("id") == chat_id for m in load_managers())
+def is_admin(chat_id): return chat_id == ADMIN_CHAT_ID
+def has_access(chat_id): return is_admin(chat_id) or is_manager(chat_id)
 
 def add_manager(chat_id, username=None, first_name=None, last_name=None, phone=None):
     managers = load_managers()
@@ -306,15 +370,13 @@ def add_manager(chat_id, username=None, first_name=None, last_name=None, phone=N
         if m.get("id") == chat_id: return False
     managers.append({"id": chat_id, "username": username or "", "first_name": first_name or "",
                      "last_name": last_name or "", "phone": phone or ""})
-    save_managers(managers)
-    return True
+    save_managers(managers); return True
 
 def remove_manager(chat_id):
     managers = load_managers()
     new_m = [m for m in managers if m.get("id") != chat_id]
     if len(new_m) == len(managers): return False
-    save_managers(new_m)
-    return True
+    save_managers(new_m); return True
 
 # ==================== УТИЛИТЫ ====================
 def get_moscow_today(): return datetime.datetime.now(MOSCOW_TZ).date()
@@ -332,11 +394,6 @@ def parse_money(obj) -> float:
 
 def parse_price(product) -> float: return parse_money(product.get("price"))
 
-def type_name(type_id, cat):
-    if type_id in TYPE_ID_NAMES: return TYPE_ID_NAMES[type_id]
-    fb = CATEGORY_FALLBACK.get(cat, "Услуги")
-    return f"{fb} (type {type_id})" if type_id else fb
-
 def calc_delta(cur, prev):
     if prev == 0: return None
     try: return ((cur - prev) / abs(prev)) * 100
@@ -345,6 +402,17 @@ def calc_delta(cur, prev):
 def fmt_pct(val):
     if val is None: return "∞"
     return f"+{val:.1f}%" if val > 0 else f"{val:.1f}%"
+
+def indicator(value_current, value_prev, better_is_higher):
+    if value_prev is None or value_current is None: return ""
+    if value_prev == 0:
+        return "🟢" if value_current > 0 else ""
+    delta = calc_delta(value_current, value_prev)
+    if delta is None: return ""
+    if better_is_higher:
+        return "🟢" if delta > 0 else ("🔴" if delta < 0 else "")
+    else:
+        return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
 
 def validate_date(date_str):
     try:
@@ -384,7 +452,7 @@ class RateLimiter:
             if w > 0: await asyncio.sleep(w)
             self.last = time.time()
 
-# ==================== ИНИЦИАЛИЗАЦИЯ ====================
+# ==================== INIT ====================
 async def init_http_session(app):
     global _http_session, _postings_sem, _finance_sem, _perf_sem
     global _postings_rate, _finance_rate, _perf_rate
@@ -551,6 +619,7 @@ def aggregate_finance_expenses(accruals):
     result = {}
     def add(name, amount):
         if amount > 0: result[name] = result.get(name, 0) + amount
+
     for item in accruals:
         if not isinstance(item, dict): continue
         cat = item.get("accrued_category", "")
@@ -563,19 +632,28 @@ def aggregate_finance_expenses(accruals):
                 delivery = product.get("delivery") or {}
                 for svc in delivery.get("services", []) or []:
                     tid = svc.get("type_id"); amt = parse_money(svc.get("accrued"))
-                    if amt < 0: add(type_name(tid, cat), abs(amt))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+                        register_expense_hit(tid, abs(amt))
             continue
         if cat == "ITEM":
             i_fees = item.get("item_fees") or {}
             for grp in i_fees.get("fees", []) or []:
                 for fee in grp.get("fees", []) or []:
                     tid = fee.get("type_id"); amt = parse_money(fee.get("accrued"))
-                    if amt < 0: add(type_name(tid, cat), abs(amt))
+                    if amt < 0:
+                        name = type_name(tid, cat)
+                        add(name, abs(amt))
+                        register_expense_hit(tid, abs(amt))
             continue
         if cat == "NON_ITEM":
             non = item.get("non_item_fee") or {}
             tid = non.get("type_id"); amt = parse_money(non.get("accrued"))
-            if amt < 0: add(type_name(tid, cat), abs(amt))
+            if amt < 0:
+                name = type_name(tid, cat)
+                add(name, abs(amt))
+                register_expense_hit(tid, abs(amt))
             continue
         if cat == "CONTAINER":
             cont = item.get("container_fees") or {}
@@ -584,6 +662,8 @@ def aggregate_finance_expenses(accruals):
             continue
         total = parse_money(item.get("total_amount"))
         if total < 0: add(cat or "Прочее", abs(total))
+
+    flush_expense_types()
     return result
 
 def aggregate_postings_range(postings, df, dt):
@@ -674,8 +754,7 @@ async def get_monthly_delivered_sum(year):
 
 async def generate_sales_chart(years):
     data = {}
-    for y in years:
-        data[y] = await get_monthly_delivered_sum(y)
+    for y in years: data[y] = await get_monthly_delivered_sum(y)
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
     for y, vals in data.items():
@@ -745,24 +824,28 @@ async def generate_product_chart(sku, metric, years):
     return buf
 
 # ==================== ФОРМАТИРОВАНИЕ ====================
-def format_expense_block(exp, title, limit=20):
+def format_expense_block(exp, title, limit=25):
     if not exp: return f"🔹 *{title}*\nНет данных о расходах.\n"
     total = sum(exp.values())
-    lines = [f"🔹 *{title}*", f"  *Итого:* {total:,.2f} ₽"]
+    lines = [f"🔹 *{title}*", f"  *Итого расходов:* {total:,.2f} ₽"]
     for k, v in sorted(exp.items(), key=lambda x: x[1], reverse=True)[:limit]:
         lines.append(f"    {k}: {v:,.2f} ₽")
     return "\n".join(lines)
 
 def format_top_products(products, title, limit=15):
-    if not products: return f"📦 *{title}*\nНет данных."
+    if not products: return f"📦 *{title}*\n\n❌ Нет данных за указанный период."
     sorted_items = sorted(products.items(), key=lambda x: x[1]["ordered_sum"], reverse=True)[:limit]
     lines = [f"📦 *{title}*", ""]
     for i, (sku, s) in enumerate(sorted_items, 1):
         name = s["name"][:40]; oid = s["offer_id"]
-        lines.append(f"{i}. {name}" + (f" (Арт: {oid})" if oid else ""))
-        lines.append(f"   🛒 {fmt_num(s['ordered_sum'])} ₽ / {s['ordered_units']} шт.")
-        lines.append(f"   📦 {fmt_num(s['delivered_sum'])} ₽ / {s['delivered_units']} шт.")
-        lines.append(f"   ❌ {fmt_num(s['canceled_sum'])} ₽ / {s['canceled_units']} шт.")
+        avg = (s["ordered_sum"] / s["order_count"]) if s["order_count"] > 0 else 0
+        line = f"{i}. SKU: {sku} | {name}"
+        if oid: line += f" | Арт: {oid}"
+        lines.append(line)
+        lines.append(f"   🛒 Заказано: {fmt_num(s['ordered_sum'])} ₽ / {s['ordered_units']} шт.")
+        lines.append(f"   📦 Доставлено: {fmt_num(s['delivered_sum'])} ₽ / {s['delivered_units']} шт.")
+        lines.append(f"   ❌ Отменено: {fmt_num(s['canceled_sum'])} ₽ / {s['canceled_units']} шт.")
+        lines.append(f"   💰 Средний чек: {fmt_num(avg)} ₽")
         lines.append("")
     return "\n".join(lines)
 
@@ -772,35 +855,67 @@ def format_products_summary(products):
     units = sum(p["ordered_units"] for p in products.values())
     orders = sum(p["order_count"] for p in products.values())
     avg = (rev / orders) if orders > 0 else 0
-    return (f"Сводка: товаров {len(products)} | выручка {fmt_num(rev)} ₽ | "
-            f"единиц {units} | заказов {orders} | ср.чек {fmt_num(avg)} ₽")
+    return (f"Сводка\n  Уникальных товаров: {len(products)}\n  Общая выручка: {rev:,.2f} ₽\n"
+            f"  Всего единиц: {units}\n  Всего заказов: {orders}\n  Средний чек: {avg:,.2f} ₽")
 
 def format_period_comparison(cur, prev, name):
     lines = [f"📊 *Продажи за {name}*", ""]
-    for label, ks, ku in [("🛒 *Заказано*", "ordered_sum", "ordered_units"),
-                          ("📦 *Доставлено*", "delivered_sum", "delivered_units"),
-                          ("❌ *Отменено*", "canceled_sum", "canceled_units")]:
-        cs = cur.get(ks, 0); ps = prev.get(ks, 0)
-        cu = cur.get(ku, 0); pu = prev.get(ku, 0)
-        lines.append(label)
-        lines.append(f"  {fmt_num(cs)} ₽ ({fmt_pct(calc_delta(cs, ps))}) / {fmt_int(cu)} шт. ({fmt_pct(calc_delta(cu, pu))})")
-        lines.append(f"  vs: {fmt_num(ps)} ₽ / {fmt_int(pu)} шт.")
-        lines.append("")
-    ca = cur.get("ad_expense", 0); pa = prev.get("ad_expense", 0)
-    drr = cur.get("drr"); edrr = cur.get("effective_drr")
+    cur_os = cur.get("ordered_sum", 0); prev_os = prev.get("ordered_sum", 0)
+    cur_ou = cur.get("ordered_units", 0); prev_ou = prev.get("ordered_units", 0)
+    lines.append("🛒 *Заказано*")
+    lines.append(f"  На сумму: {fmt_num(cur_os)} ₽ {indicator(cur_os, prev_os, True)}")
+    lines.append(f"  Штук: {fmt_int(cur_ou)} {indicator(cur_ou, prev_ou, True)}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_os)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_ou)}")
+    lines.append("")
+    cur_ds = cur.get("delivered_sum", 0); prev_ds = prev.get("delivered_sum", 0)
+    cur_du = cur.get("delivered_units", 0); prev_du = prev.get("delivered_units", 0)
+    lines.append("📦 *Доставлено*")
+    lines.append(f"  На сумму: {fmt_num(cur_ds)} ₽ {indicator(cur_ds, prev_ds, True)}")
+    lines.append(f"  Штук: {fmt_int(cur_du)} {indicator(cur_du, prev_du, True)}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_ds)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_du)}")
+    lines.append("")
+    cur_cs = cur.get("canceled_sum", 0); prev_cs = prev.get("canceled_sum", 0)
+    cur_cu = cur.get("canceled_units", 0); prev_cu = prev.get("canceled_units", 0)
+    cur_cr = (cur_cu / cur_du * 100) if cur_du > 0 else None
+    prev_cr = (prev_cu / prev_du * 100) if prev_du > 0 else None
+    cur_cr_txt = f"{cur_cr:.2f}%" if cur_cr is not None else "∞"
+    prev_cr_txt = f"{prev_cr:.2f}%" if prev_cr is not None else "∞"
+    lines.append("❌ *Отменено*")
+    lines.append(f"  На сумму: {fmt_num(cur_cs)} ₽ {indicator(cur_cs, prev_cs, False)}")
+    lines.append(f"  Штук: {fmt_int(cur_cu)} {indicator(cur_cu, prev_cu, False)}")
+    lines.append(f"  Доля отмен: {cur_cr_txt} {indicator(cur_cr, prev_cr, False)}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  На сумму: {fmt_num(prev_cs)} ₽")
+    lines.append(f"  Штук: {fmt_int(prev_cu)}")
+    lines.append(f"  Доля отмен: {prev_cr_txt}")
+    lines.append("")
+    cur_ad = cur.get("ad_expense", 0); prev_ad = prev.get("ad_expense", 0)
+    cur_drr = cur.get("drr"); prev_drr = prev.get("drr")
+    cur_edrr = cur.get("effective_drr"); prev_edrr = prev.get("effective_drr")
+    cur_drr_txt = f"{cur_drr:.2f}%" if cur_drr is not None else "∞"
+    cur_edrr_txt = f"{cur_edrr:.2f}%" if cur_edrr is not None else "∞"
+    prev_drr_txt = f"{prev_drr:.2f}%" if prev_drr is not None else "∞"
+    prev_edrr_txt = f"{prev_edrr:.2f}%" if prev_edrr is not None else "∞"
     lines.append("📢 *Реклама*")
-    lines.append(f"  {fmt_num(ca)} ₽ ({fmt_pct(calc_delta(ca, pa))})")
-    lines.append(f"  ДРР: {f'{drr:.2f}%' if drr is not None else '∞'} | "
-                 f"ДРР по доставл.: {f'{edrr:.2f}%' if edrr is not None else '∞'}")
-    lines.append(f"  vs: {fmt_num(pa)} ₽"); lines.append("")
+    lines.append(f"  Расходы: {fmt_num(cur_ad)} ₽ {indicator(cur_ad, prev_ad, False)}")
+    lines.append(f"  ДРР (общий): {cur_drr_txt} {indicator(cur_drr, prev_drr, False)}")
+    lines.append(f"  ДРР (по доставленным): {cur_edrr_txt} {indicator(cur_edrr, prev_edrr, False)}")
+    lines.append("vs предыдущий период:")
+    lines.append(f"  Расходы: {fmt_num(prev_ad)} ₽")
+    lines.append(f"  ДРР (общий): {prev_drr_txt}")
+    lines.append(f"  ДРР (по доставленным): {prev_edrr_txt}")
+    lines.append("")
     lines.append(format_expense_block(cur.get("expenses", {}), "Расходы за период"))
     return "\n".join(lines)
 
 # ==================== СБОРКА МЕТРИК ====================
 async def get_period_metrics(df, dt):
     postings, ad, fin = await asyncio.gather(
-        fetch_postings(df, dt),
-        fetch_advertising_expense(df, dt),
+        fetch_postings(df, dt), fetch_advertising_expense(df, dt),
         fetch_finance_transactions(df, dt))
     agg = aggregate_postings_range(postings, df, dt)
     exp = aggregate_finance_expenses(fin)
@@ -810,7 +925,12 @@ async def get_period_metrics(df, dt):
             "effective_drr": (ad / dsum * 100) if dsum > 0 else None,
             "expenses": exp}
 
+# ==================== ОТЧЁТЫ ====================
 async def build_today_report(include_yesterday=False):
+    """
+    include_yesterday=False → обычный отчёт: Сегодня + Текущий месяц + Расходы
+    include_yesterday=True  → отчёт за Вчера: Вчера + Текущий месяц + Расходы
+    """
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
@@ -819,62 +939,113 @@ async def build_today_report(include_yesterday=False):
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
-    postings_cur, postings_prev, ad_t, ad_m, fin_t, fin_m = await asyncio.gather(
+    # Всегда загружаем всё нужное
+    postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
-        fetch_advertising_expense(today, today), fetch_advertising_expense(cm_s, today),
+        fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
+        fetch_advertising_expense(cm_s, today), fetch_advertising_expense(pm_s, pm_e_s),
         fetch_finance_transactions(today, today), fetch_finance_transactions(cm_s, today))
+
     t_m = aggregate_postings_range(postings_cur, today, today)
     y_m = aggregate_postings_range(postings_cur, yest, yest)
     m_m = aggregate_postings_range(postings_cur, cm_s, today)
     p_m = aggregate_postings_range(postings_prev, pm_s, pm_e_s)
-    exp_t = aggregate_finance_expenses(fin_t); exp_m = aggregate_finance_expenses(fin_m)
+
+    exp_t = aggregate_finance_expenses(fin_t)
+    exp_m = aggregate_finance_expenses(fin_m)
     if ad_t > 0: exp_t["Оплата за клик"] = exp_t.get("Оплата за клик", 0) + ad_t
     if ad_m > 0: exp_m["Оплата за клик"] = exp_m.get("Оплата за клик", 0) + ad_m
 
     def blk_today():
         os_ = t_m["ordered_sum"]; ou_ = t_m["ordered_units"]
         cs_ = t_m["canceled_sum"]; cu_ = t_m["canceled_units"]
-        du = t_m["delivered_units"]; cr = (cu_ / du * 100) if du > 0 else None
-        return (f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
-                f"  🛒 {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
-                f"    vs вчера: {fmt_pct(calc_delta(os_, y_m['ordered_sum']))} / "
-                f"{fmt_pct(calc_delta(ou_, y_m['ordered_units']))}\n"
-                f"  ❌ {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
-                f"  Доля отмен: {f'{cr:.2f}%' if cr is not None else '∞'}")
+        ys_ = y_m["ordered_sum"]; yu_ = y_m["ordered_units"]
+        ycs_ = y_m["canceled_sum"]; ycu_ = y_m["canceled_units"]
+        d_os = fmt_pct(calc_delta(os_, ys_)); d_ou = fmt_pct(calc_delta(ou_, yu_))
+        d_cs = fmt_pct(calc_delta(cs_, ycs_)); d_cu = fmt_pct(calc_delta(cu_, ycu_))
+        du_ = t_m["delivered_units"]
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
+        cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
+        return (
+            f"🔹 *Сегодня (на {now.strftime('%H:%M')} МСК)*\n"
+            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
+            f"    vs Вчера: \n  {d_os} ₽ / {d_ou} шт.\n\n"
+            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+            f"    vs Вчера: \n  {d_cs} ₽ / {d_cu} шт.\n"
+            f"  Доля отмен: {cr_txt}\n"
+        )
+
+    def blk_yesterday():
+        os_ = y_m["ordered_sum"]; ou_ = y_m["ordered_units"]
+        ds_ = y_m["delivered_sum"]; du_ = y_m["delivered_units"]
+        cs_ = y_m["canceled_sum"]; cu_ = y_m["canceled_units"]
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
+        cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
+        drr = (ad_y / os_ * 100) if os_ > 0 else None
+        edrr = (ad_y / ds_ * 100) if ds_ > 0 else None
+        drr_txt = f"{drr:.2f}%" if drr is not None else "∞"
+        edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
+        yest_dt = datetime.datetime.strptime(yest, "%Y-%m-%d").date()
+        yest_fmt = yest_dt.strftime("%d.%m.%Y")
+        return (
+            f"🔹 *Вчера ({yest_fmt}, полный день)*\n"
+            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n\n"
+            f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n\n"
+            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+            f"  Доля отмен: {cr_txt}\n\n"
+            f"  📢 Реклама: {fmt_num(ad_y)} ₽\n"
+            f"  ДРР (общий): {drr_txt} | ДРР (по доставленным): {edrr_txt}"
+        )
+
     def blk_month():
         os_ = m_m["ordered_sum"]; ou_ = m_m["ordered_units"]
         ds_ = m_m["delivered_sum"]; du_ = m_m["delivered_units"]
         cs_ = m_m["canceled_sum"]; cu_ = m_m["canceled_units"]
+        p_os = p_m["ordered_sum"]; p_ou = p_m["ordered_units"]
+        p_ds = p_m["delivered_sum"]; p_du = p_m["delivered_units"]
+        p_cs = p_m["canceled_sum"]; p_cu = p_m["canceled_units"]
+        d_os = fmt_pct(calc_delta(os_, p_os)); d_ou = fmt_pct(calc_delta(ou_, p_ou))
+        d_ds = fmt_pct(calc_delta(ds_, p_ds)); d_du = fmt_pct(calc_delta(du_, p_du))
+        d_cs = fmt_pct(calc_delta(cs_, p_cs)); d_cu = fmt_pct(calc_delta(cu_, p_cu))
+        cr = (cu_ / du_ * 100) if du_ > 0 else None
+        p_cr = (p_cu / p_du * 100) if p_du > 0 else None
+        cr_txt = f"{cr:.2f}%" if cr is not None else "∞"
+        p_cr_txt = f"{p_cr:.2f}%" if p_cr is not None else "∞"
+        d_cr = fmt_pct(calc_delta(cr if cr is not None else 0, p_cr if p_cr is not None else 0))
         drr = (ad_m / os_ * 100) if os_ > 0 else None
         edrr = (ad_m / ds_ * 100) if ds_ > 0 else None
-        return (f"🔹 *Текущий месяц*\n"
-                f"  🛒 {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт. "
-                f"({fmt_pct(calc_delta(os_, p_m['ordered_sum']))} / "
-                f"{fmt_pct(calc_delta(ou_, p_m['ordered_units']))})\n"
-                f"  📦 {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт. "
-                f"({fmt_pct(calc_delta(ds_, p_m['delivered_sum']))} / "
-                f"{fmt_pct(calc_delta(du_, p_m['delivered_units']))})\n"
-                f"  ❌ {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
-                f"  📢 Реклама: {fmt_num(ad_m)} ₽\n"
-                f"  ДРР: {f'{drr:.2f}%' if drr is not None else '∞'} | "
-                f"ДРР по доставл.: {f'{edrr:.2f}%' if edrr is not None else '∞'}")
+        p_drr = (ad_pm / p_os * 100) if p_os > 0 else None
+        p_edrr = (ad_pm / p_ds * 100) if p_ds > 0 else None
+        drr_txt = f"{drr:.2f}%" if drr is not None else "∞"
+        edrr_txt = f"{edrr:.2f}%" if edrr is not None else "∞"
+        p_drr_txt = f"{p_drr:.2f}%" if p_drr is not None else "∞"
+        p_edrr_txt = f"{p_edrr:.2f}%" if p_edrr is not None else "∞"
+        return (
+            f"🔹 *Текущий месяц*\n"
+            f"  🛒 Заказано: \n  {fmt_num(os_)} ₽ / {fmt_int(ou_)} шт.\n"
+            f"    vs предыдущий месяц: \n  {d_os} ₽ / {d_ou} шт.\n\n"
+            f"  📦 Доставлено: \n  {fmt_num(ds_)} ₽ / {fmt_int(du_)} шт.\n"
+            f"    vs предыдущий месяц: \n  {d_ds} ₽ / {d_du} шт.\n\n"
+            f"  ❌ Отменено: \n  {fmt_num(cs_)} ₽ / {fmt_int(cu_)} шт.\n"
+            f"    vs предыдущий месяц: \n  {d_cs} ₽ / {d_cu} шт.\n"
+            f"  Доля отмен: {cr_txt} | vs предыдущий месяц: {p_cr_txt} ({d_cr})\n\n"
+            f"  📢 Реклама: \n  {fmt_num(ad_m)} ₽ | vs предыдущий месяц: {fmt_num(ad_pm)} ₽\n"
+            f"  ДРР (общий): {drr_txt} | vs предыдущий месяц: {p_drr_txt}\n"
+            f"  ДРР (по доставленным): {edrr_txt} | vs предыдущий месяц: {p_edrr_txt}"
+        )
 
     parts = []
     if include_yesterday:
-        def blk_yesterday():
-            yest_str = yest
-            postings_y = postings_cur  # уже загружены
-            yfull = aggregate_postings_range(postings_y, yest_str, yest_str)
-            ad_y = ad_t  # переиспользуем дневную рекламу (она за сегодня, для вчера нужен отдельный запрос)
-            return f"🔹 *Вчера ({yest_str})*\n" \
-                   f"  🛒 Заказано: {fmt_num(yfull['ordered_sum'])} ₽ / {fmt_int(yfull['ordered_units'])} шт.\n" \
-                   f"  📦 Доставлено: {fmt_num(yfull['delivered_sum'])} ₽ / {fmt_int(yfull['delivered_units'])} шт.\n" \
-                   f"  ❌ Отменено: {fmt_num(yfull['canceled_sum'])} ₽ / {fmt_int(yfull['canceled_units'])} шт."
         parts.append(blk_yesterday())
-    parts.append(blk_today()); parts.append(blk_month())
+        parts.append(blk_month())
+        header = "📊 *Отчёт за Вчера*"
+    else:
+        parts.append(blk_today())
+        parts.append(blk_month())
+        header = "📊 *Продажи за сегодня*"
     parts.append(format_expense_block(exp_t, "Расходы сегодня"))
     parts.append(format_expense_block(exp_m, "Расходы за текущий месяц"))
-    return "📊 *Продажи*\n\n\n" + "\n\n".join(parts)
+    return header + "\n\n\n" + "\n\n".join(parts)
 
 async def build_period_report(df, dt, name):
     pf, pt = prev_period(df, dt)
@@ -912,19 +1083,23 @@ def main_kb(chat_id):
     ]
     if is_admin(chat_id):
         buttons.append([KeyboardButton("⚙️ Администрирование")])
+        buttons.append([KeyboardButton("📚 Справочник расходов")])
     buttons.append([KeyboardButton("📖 Справка")])
     return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+def access_check_kb():
+    return ReplyKeyboardMarkup([[KeyboardButton("🔄 Проверить доступ")]], resize_keyboard=True)
 
 def sales_reports_kb():
     return ReplyKeyboardMarkup([
         [KeyboardButton("📅 Продажи за сегодня")],
-        [KeyboardButton("📅 Выбрать дату"), KeyboardButton("📆 Выбрать период")],
+        [KeyboardButton("📆 Выбрать дату"), KeyboardButton("📊 Выбрать период")],
         [KeyboardButton("📈 Динамика продаж")],
         [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
 
 def products_reports_kb():
     return ReplyKeyboardMarkup([
-        [KeyboardButton("📦 Топ товаров за сегодня")],
+        [KeyboardButton("📅 Топ товаров за сегодня")],
         [KeyboardButton("🏆 Товары за период")],
         [KeyboardButton("📈 Динамика по товару")],
         [KeyboardButton("🔙 Назад")]], resize_keyboard=True)
@@ -951,6 +1126,11 @@ def products_period_kb():
         [InlineKeyboardButton("✏️ Произвольный период", callback_data="tpc")],
         [InlineKeyboardButton("🔙 Назад", callback_data="tpcancel")]])
 
+def expense_types_kb():
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Обновить", callback_data="et_refresh")],
+        [InlineKeyboardButton("🔙 Назад", callback_data="et_back")]])
+
 def hours_kb(selected, prefix, available=None):
     kb = []
     hrs = sorted(available) if available is not None else list(range(1, 25))
@@ -974,8 +1154,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.effective_chat.id
     user = update.effective_user
     if not has_access(chat_id):
-        await update.message.reply_text("❌ Нет доступа! Обратитесь к администратору.",
-                                        reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            "❌ Нет доступа! Обратитесь к администратору.\n\n"
+            "После получения доступа нажмите «🔄 Проверить доступ».",
+            reply_markup=access_check_kb())
         return
     name = user.first_name or ""
     hour = datetime.datetime.now(MOSCOW_TZ).hour
@@ -989,10 +1171,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user_has_schedule(chat_id):
         await update.message.reply_text(
             "⚠️ *Необходимо настроить автоматические рассылки!*\n\n"
-            "Зайдите в раздел «🔔 Автоматические рассылки» и настройте:\n"
-            "1. Часы рассылок\n"
-            "2. Часы отправки отчёта за Вчера",
+            "Зайдите в раздел «🔔 Автоматические рассылки» и выберите часы рассылок.",
             parse_mode="Markdown")
+
+async def check_access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    if not has_access(chat_id):
+        await update.message.reply_text("❌ Доступа пока нет. Попробуйте позже.",
+                                        reply_markup=access_check_kb())
+        return
+    await update.message.reply_text("✅ Доступ получен!", reply_markup=main_kb(chat_id))
 
 async def version_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"🤖 Версия: {VERSION}")
@@ -1001,8 +1189,7 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
     if not has_access(chat_id):
-        await update.message.reply_text("❌ Нет доступа.")
-        return
+        await update.message.reply_text("❌ Нет доступа.", reply_markup=access_check_kb()); return
     if text == "📊 Отчёт по продажам":
         await update.message.reply_text("Отчёты по продажам:", reply_markup=sales_reports_kb())
     elif text == "📦 Отчёт по товарам":
@@ -1012,44 +1199,146 @@ async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                         reply_markup=auto_kb(), parse_mode="Markdown")
     elif text == "⚙️ Администрирование":
         if not is_admin(chat_id):
-            await update.message.reply_text("⛔ Только для администратора.")
-            return
+            await update.message.reply_text("⛔ Только для администратора."); return
         await update.message.reply_text("Управление менеджерами:", reply_markup=admin_kb())
+    elif text == "📚 Справочник расходов":
+        if not is_admin(chat_id):
+            await update.message.reply_text("⛔ Только для администратора."); return
+        await show_expense_types(update, context)
     elif text == "📖 Справка":
         await send_help(update, context)
+
+# ==================== СПРАВОЧНИК РАСХОДОВ (UI) ====================
+async def show_expense_types(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = get_expense_types()
+    if not data:
+        await update.message.reply_text("Справочник пуст. Он заполнится после первого отчёта.")
+        return
+    items = []
+    for tid, entry in data.items():
+        if isinstance(entry, dict):
+            name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
+        else:
+            name = str(entry); cnt = 0; sm = 0.0
+        items.append((tid, name, cnt, sm))
+    def sort_key(x):
+        is_unknown = x[1].startswith("❓") or "(type " in x[1]
+        return (is_unknown, -x[3])
+    items.sort(key=sort_key)
+    known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+    unknown = [i for i in items if i not in known]
+    lines = ["📚 *Справочник расходов*", "_Файл: /app/data/expense_types.json_", ""]
+    lines.append(f"*Распознано услуг:* {len(known)}")
+    lines.append(f"*Требуют уточнения:* {len(unknown)}")
+    lines.append("")
+    if known:
+        lines.append("✅ *Известные услуги:*")
+        for tid, name, cnt, sm in known[:30]:
+            if cnt > 0:
+                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+            else:
+                lines.append(f"  `{tid}` → {name}")
+        lines.append("")
+    if unknown:
+        lines.append("❓ *Требуют уточнения (правьте файл вручную):*")
+        for tid, name, cnt, sm in unknown[:30]:
+            if cnt > 0:
+                lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+            else:
+                lines.append(f"  `{tid}` → {name}")
+    text = "\n".join(lines)
+    if len(text) > 4000: text = text[:4000] + "\n\n_…список обрезан, смотрите файл_"
+    try:
+        await update.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
+    except Exception:
+        await update.message.reply_text(text[:4000], reply_markup=expense_types_kb())
+
+async def expense_types_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query; await q.answer(); d = q.data
+    chat_id = q.message.chat_id
+    if not is_admin(chat_id):
+        await q.edit_message_text("⛔ Только для админа."); return
+    if d == "et_back":
+        await q.edit_message_text("Главное меню:", reply_markup=None)
+        await q.message.reply_text("Выберите действие:", reply_markup=main_kb(chat_id))
+    elif d == "et_refresh":
+        global _expense_types_cache
+        _expense_types_cache = _load_expense_types_sync()
+        await q.edit_message_text("🔄 Справочник перечитан.")
+        data = get_expense_types()
+        items = []
+        for tid, entry in data.items():
+            if isinstance(entry, dict):
+                name = entry.get("name", "?"); cnt = entry.get("count", 0); sm = entry.get("sum", 0.0)
+            else:
+                name = str(entry); cnt = 0; sm = 0.0
+            items.append((tid, name, cnt, sm))
+        def sort_key(x):
+            is_unknown = x[1].startswith("❓") or "(type " in x[1]
+            return (is_unknown, -x[3])
+        items.sort(key=sort_key)
+        known = [i for i in items if not (i[1].startswith("❓") or "(type " in i[1] and "Услуги" in i[1])]
+        unknown = [i for i in items if i not in known]
+        lines = ["📚 *Справочник расходов*", f"_Всего записей: {len(items)}_", ""]
+        if known:
+            lines.append("✅ *Известные:*")
+            for tid, name, cnt, sm in known[:30]:
+                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+                else: lines.append(f"  `{tid}` → {name}")
+        if unknown:
+            lines.append(""); lines.append("❓ *Требуют уточнения:*")
+            for tid, name, cnt, sm in unknown[:30]:
+                if cnt > 0: lines.append(f"  `{tid}` → {name} ({cnt}× / {sm:,.0f} ₽)")
+                else: lines.append(f"  `{tid}` → {name}")
+        text = "\n".join(lines)
+        if len(text) > 4000: text = text[:4000] + "\n\n_…обрезано_"
+        try:
+            await q.message.reply_text(text, parse_mode="Markdown", reply_markup=expense_types_kb())
+        except Exception:
+            await q.message.reply_text(text[:4000], reply_markup=expense_types_kb())
 
 async def send_help(update, context):
     chat_id = update.effective_chat.id
     common = (
         "📖 *Справка*\n\n"
         "🔹 *Основные функции*\n"
-        "• 📊 Отчёт по продажам — сводка за сегодня и текущий месяц.\n"
-        "• 📦 Отчёт по товарам — топ товаров и периоды.\n"
-        "• 📈 Динамика продаж — график доставленных заказов по месяцам.\n"
-        "• 📈 Динамика по товару — график конкретного товара.\n"
-        "• 🔔 Автоматические рассылки — персональные отчёты.\n\n"
-        "🔹 *Автоматические рассылки (персональные)*\n"
-        "• 🕒 Выбор времени рассылок — задайте часы.\n"
-        "• 📅 Добавление отчёта за Вчера — выберите часы из разрешённых.\n"
-        "• 🔕 Режим тишины — интервал, когда рассылки не отправляются.\n"
-        "• 📤 Отправить отчёт за Вчера сейчас — тест.\n\n"
+        "• 📊 Отчёт по продажам – актуальная сводка за сегодня и текущий месяц.\n"
+        "• 📦 Отчёт по товарам – топ товаров по выручке.\n"
+        "• 📆 Выбрать дату – данные за конкретный день.\n"
+        "• 📊 Выбрать период – месяц/квартал/год/произвольный.\n"
+        "• 📈 Динамика продаж – график доставленных заказов по месяцам.\n"
+        "• 📈 Динамика по товару – график продаж конкретного товара.\n"
+        "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
+        "🔹 *Автоматические отчёты (персональные)*\n"
+        "• 🕒 Выбор времени рассылок – общие часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
+        "• 📅 Добавление отчёта за Вчера – часы из выбранных, когда отправляется отчёт с блоком «Вчера».\n"
+        "• 🔕 Режим тишины – интервал, когда рассылки не отправляются.\n"
+        "• 📤 Отправить сейчас – принудительная отправка отчёта за Вчера.\n\n"
+        "🔹 *Метрики*\n"
+        "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено – суммы и шт.\n"
+        "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
+        "• 💰 Расходы (финансовые) – разбивка по услугам.\n\n"
+        "🔹 *Сравнение*\n"
+        "• «Сегодня» – с аналогичным временем вчера.\n"
+        "• «Текущий месяц» – с аналогичным периодом предыдущего.\n\n"
         "🔹 *Часовой пояс*\n"
-        "• Все расчёты — по московскому времени (МСК, UTC+3).\n\n"
-        f"🤖 Версия бота: {VERSION}"
+        "• Все расчёты – по московскому времени (МСК, UTC+3).\n\n"
     )
     if is_admin(chat_id):
         help_text = common + (
-            "\n\n🔹 *Администрирование (только админ)*\n"
-            "• ➕ Добавить менеджера — ID или @username + телефон.\n"
-            "• ➖ Удалить менеджера — по ID.\n"
-            "• 📋 Список менеджеров.\n\n"
-            "⚠️ Каждый менеджер настраивает свои рассылки сам — администратор их не настраивает."
+            "🔹 *Администрирование (только админ)*\n"
+            "• ➕ Добавить менеджера – ID или @username + телефон.\n"
+            "• ➖ Удалить менеджера – по ID.\n"
+            "• 📋 Список менеджеров.\n"
+            "• 📚 Справочник расходов – просмотр type_id и их названий (файл /app/data/expense_types.json).\n\n"
+            "⚠️ Каждый менеджер настраивает свои рассылки самостоятельно.\n"
+            f"🤖 Версия бота: {VERSION}"
         )
     else:
-        help_text = common
+        help_text = common + f"🤖 Версия бота: {VERSION}"
     await update.message.reply_text(help_text, parse_mode="Markdown")
 
-# ==================== ПРОДАЖИ: СЕГОДНЯ / ДАТА / ПЕРИОД ====================
+# ==================== ПРОДАЖИ ====================
 async def today_report(update, context):
     if not has_access(update.effective_chat.id): return
     msg = await update.message.reply_text("⏳ Загружаю данные за сегодня...")
@@ -1071,7 +1360,7 @@ async def date_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
     if d == "d_cancel":
         await q.edit_message_text("Отменено.")
-        await q.message.reply_text("Выберите действие:", reply_markup=main_kb(q.message.chat_id))
+        await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         return ConversationHandler.END
     if d.startswith("d_prev_") or d.startswith("d_next_"):
         m = re.search(r'(prev|next)_(\d+)_(\d+)', d)
@@ -1474,7 +1763,7 @@ async def products_custom_end(update, context):
             return ConversationHandler.END
     return WAITING_PRODUCT_PERIOD_END
 
-# ==================== ГРАФИК: ДИНАМИКА ПРОДАЖ ====================
+# ==================== ГРАФИКИ ====================
 async def dynamics_menu(update, context):
     if not has_access(update.effective_chat.id): return
     kb = InlineKeyboardMarkup([
@@ -1534,12 +1823,10 @@ async def dynamics_year_cb(update, context):
 async def dynamics_range_start(update, context):
     t = update.message.text.strip()
     if not t.isdigit():
-        await update.message.reply_text("❌ Введите число (год).")
-        return WAITING_DYN_RANGE_START
+        await update.message.reply_text("❌ Введите число (год)."); return WAITING_DYN_RANGE_START
     y = int(t); cy = get_moscow_today().year
     if y < 2000 or y > cy:
-        await update.message.reply_text(f"❌ Год от 2000 до {cy}.")
-        return WAITING_DYN_RANGE_START
+        await update.message.reply_text(f"❌ Год от 2000 до {cy}."); return WAITING_DYN_RANGE_START
     context.user_data['dyn_rs'] = y
     await update.message.reply_text("Введите конечный год:")
     return WAITING_DYN_RANGE_END
@@ -1547,8 +1834,7 @@ async def dynamics_range_start(update, context):
 async def dynamics_range_end(update, context):
     t = update.message.text.strip()
     if not t.isdigit():
-        await update.message.reply_text("❌ Введите число.")
-        return WAITING_DYN_RANGE_END
+        await update.message.reply_text("❌ Введите число."); return WAITING_DYN_RANGE_END
     ye = int(t); ys_ = context.user_data.get('dyn_rs')
     if ys_ is None:
         await update.message.reply_text("❌ Начните заново."); return ConversationHandler.END
@@ -1568,7 +1854,6 @@ async def dynamics_range_end(update, context):
     context.user_data.pop('dyn_rs', None)
     return ConversationHandler.END
 
-# ==================== ГРАФИК: ДИНАМИКА ПО ТОВАРУ ====================
 async def product_chart_menu(update, context):
     if not has_access(update.effective_chat.id): return
     msg = await update.message.reply_text("⏳ Загружаю топ товаров за 30 дней...")
@@ -1730,7 +2015,7 @@ async def product_chart_range_end(update, context):
     context.user_data.pop('pc_rs', None)
     return ConversationHandler.END
 
-# ==================== АВТОМАТИЧЕСКИЕ РАССЫЛКИ (персональные) ====================
+# ==================== РАССЫЛКИ ====================
 async def auto_schedule_start(update, context):
     chat_id = update.effective_chat.id
     if not has_access(chat_id): return
@@ -1739,9 +2024,13 @@ async def auto_schedule_start(update, context):
     current = us.get("schedule_hours", [])
     context.user_data['temp_sch'] = list(current)
     if current:
-        txt = f"Текущие часы: {', '.join(f'{h:02d}:00' for h in sorted(current))}\nНажмите для изменения:"
+        txt = f"Текущие часы: {', '.join(f'{h:02d}:00' for h in sorted(current))}\n\n" \
+              "В эти часы будет отправляться обычный отчёт (Сегодня + Текущий месяц).\n\n" \
+              "Нажмите для изменения:"
     else:
-        txt = "Часы рассылок не настроены. Выберите часы:"
+        txt = "Часы рассылок не настроены.\n\n" \
+              "В выбранные часы будет отправляться обычный отчёт (Сегодня + Текущий месяц).\n\n" \
+              "Выберите часы:"
     await update.message.reply_text(txt, reply_markup=hours_kb(current, "sch_"))
 
 async def auto_yesterday_start(update, context):
@@ -1751,13 +2040,15 @@ async def auto_yesterday_start(update, context):
     us = get_user_settings(settings, chat_id)
     sch = us.get("schedule_hours", [])
     if not sch:
-        await update.message.reply_text("❌ Сначала настройте «Выбор времени рассылок».")
-        return
+        await update.message.reply_text("❌ Сначала настройте «Выбор времени рассылок»."); return
     cur = us.get("yesterday_report_hours", [])
     context.user_data['temp_yest'] = list(cur)
     await update.message.reply_text(
-        "Выберите часы отправки отчёта за Вчера (из ваших часов рассылок):",
-        reply_markup=hours_kb(cur, "yest_", available=sch))
+        "Выберите часы, в которые будет отправляться отчёт *с блоком «Вчера»* "
+        "(из ваших часов рассылок):\n\n"
+        "⚠️ В выбранные часы отчёт *с Вчера* будет заменять обычный отчёт.",
+        reply_markup=hours_kb(cur, "yest_", available=sch),
+        parse_mode="Markdown")
 
 async def auto_silence_start(update, context):
     chat_id = update.effective_chat.id
@@ -1791,14 +2082,10 @@ async def auto_send_now(update, context):
 
 async def auto_menu_router(update, context):
     t = update.message.text
-    if t == "🕒 Выбор времени рассылок":
-        await auto_schedule_start(update, context)
-    elif t == "📅 Добавление отчета за Вчера":
-        await auto_yesterday_start(update, context)
-    elif t == "🔕 Режим тишины":
-        await auto_silence_start(update, context)
-    elif t == "📤 Отправить отчет за Вчера сейчас":
-        await auto_send_now(update, context)
+    if t == "🕒 Выбор времени рассылок": await auto_schedule_start(update, context)
+    elif t == "📅 Добавление отчета за Вчера": await auto_yesterday_start(update, context)
+    elif t == "🔕 Режим тишины": await auto_silence_start(update, context)
+    elif t == "📤 Отправить отчет за Вчера сейчас": await auto_send_now(update, context)
     elif t == "🔙 Назад":
         await update.message.reply_text("Главное меню:", reply_markup=main_kb(update.effective_chat.id))
 
@@ -1822,6 +2109,7 @@ async def schedule_cb(update, context):
         settings = await load_settings()
         us = get_user_settings(settings, chat_id)
         us["schedule_hours"] = temp
+        # Удаляем из yesterday_report_hours часы, которых больше нет в schedule_hours
         us["yesterday_report_hours"] = [h for h in us.get("yesterday_report_hours", []) if h in temp]
         settings[str(chat_id)] = us
         await save_settings(settings)
@@ -1857,7 +2145,7 @@ async def yesterday_cb(update, context):
         settings[str(chat_id)] = us
         await save_settings(settings)
         txt = ', '.join(f'{h:02d}:00' for h in sorted(temp)) if temp else 'не выбраны'
-        await q.edit_message_text(f"✅ Сохранено. Часы отчёта за Вчера: {txt}")
+        await q.edit_message_text(f"✅ Сохранено. Часы отчёта с «Вчера»: {txt}")
         await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
         return ConversationHandler.END
     return WAITING_AUTO_YESTERDAY
@@ -1886,7 +2174,6 @@ async def silence_cb(update, context):
 
 async def silence_start_cb(update, context):
     q = update.callback_query; await q.answer(); d = q.data
-    chat_id = q.message.chat_id
     if d == "sil_s_back":
         await q.edit_message_text("Отменено.")
         await q.message.reply_text("Выберите действие:", reply_markup=auto_kb())
@@ -1965,7 +2252,8 @@ async def admin_add_phone(update, context):
     if not d:
         await update.message.reply_text("❌ Потеряны данные."); return ConversationHandler.END
     if add_manager(d["id"], d["username"], d["first_name"], d["last_name"], ph):
-        await update.message.reply_text(f"✅ Менеджер {d['id']} добавлен.")
+        await update.message.reply_text(f"✅ Менеджер {d['id']} добавлен.\n"
+            "Попросите его отправить /start — он сразу получит доступ.")
     else:
         await update.message.reply_text(f"⚠️ Менеджер {d['id']} уже существует.")
     context.user_data.pop('new_m', None)
@@ -1995,8 +2283,7 @@ async def admin_list(update, context):
     if not is_admin(update.effective_chat.id): return
     ms = load_managers()
     if not ms:
-        await update.message.reply_text("Список менеджеров пуст.")
-        return
+        await update.message.reply_text("Список менеджеров пуст."); return
     lines = ["📋 Список менеджеров:"]
     for m in ms:
         info = f"ID: {m.get('id')}"
@@ -2008,42 +2295,50 @@ async def admin_list(update, context):
 
 # ==================== ПЛАНИРОВЩИК ====================
 async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
-    """Раз в 15 минут: рассылки по расписанию + напоминание в 12:00."""
+    """
+    Логика:
+    - schedule_hours = общие часы (обычный отчёт).
+    - yesterday_report_hours ⊆ schedule_hours (отчёт с блоком Вчера).
+    - В час, который в yesterday_report_hours → отправляем отчёт с Вчера.
+    - В остальные часы из schedule_hours → отправляем обычный отчёт.
+    - last_sent_regular и last_sent_yesterday — независимые ключи.
+    """
     now = datetime.datetime.now(MOSCOW_TZ)
-    cur_hour = now.hour
-    cur_date = now.strftime("%Y-%m-%d")
+    cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
 
-    # 1. Напоминание в 12:00 для пользователей без настроенных рассылок
+    # 1) Напоминание в 12:00 (только если schedule_hours пуст)
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
             try:
                 us = get_user_settings(settings, uid)
-                if us.get("schedule_hours") and us.get("yesterday_report_hours"):
+                if us.get("schedule_hours"):
                     continue
                 if us.get("last_reminder") == cur_date:
                     continue
                 await context.bot.send_message(
                     chat_id=uid,
                     text="⚠️ *Напоминание:* у вас не настроены автоматические рассылки.\n"
-                         "Зайдите в «🔔 Автоматические рассылки» и выберите часы.",
+                         "Зайдите в «🔔 Автоматические рассылки» → «🕒 Выбор времени рассылок».",
                     parse_mode="Markdown")
                 us["last_reminder"] = cur_date
                 settings[str(uid)] = us
-                write_log(f"📨 Напоминание о настройке → {uid}")
+                write_log(f"📨 Напоминание → {uid}")
             except Exception as e:
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
 
-    # 2. Рассылки отчётов по расписанию
+    # 2) Рассылки
     for sid, us in settings.items():
-        try:
-            uid = int(sid)
+        try: uid = int(sid)
         except: continue
-        yest_hours = us.get("yesterday_report_hours", [])
-        if cur_hour not in yest_hours: continue
 
+        sch = us.get("schedule_hours", [])
+        if not sch: continue
+        if cur_hour not in sch: continue
+
+        # Режим тишины
         s = us.get("silence_start"); e = us.get("silence_end")
         if s is not None and e is not None:
             if s < e:
@@ -2051,23 +2346,42 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
             else:
                 if cur_hour >= s or cur_hour < e: continue
 
-        last = us.get("last_sent")
-        if last:
-            try:
-                ld, lh = last.split()
-                if ld == cur_date and int(lh) == cur_hour:
-                    continue
-            except: pass
+        yest_hours = us.get("yesterday_report_hours", [])
 
-        write_log(f"📤 Автоотчёт → {uid}")
-        try:
-            rpt = await build_today_report(include_yesterday=True)
-            await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
-            us["last_sent"] = f"{cur_date} {cur_hour}"
-            settings[sid] = us
-            await save_settings(settings)
-        except Exception as e:
-            write_log(f"❌ Автоотчёт {uid}: {e}")
+        if cur_hour in yest_hours:
+            # Ветка «с блоком Вчера»
+            last = us.get("last_sent_yesterday")
+            if last:
+                try:
+                    ld, lh = last.split()
+                    if ld == cur_date and int(lh) == cur_hour: continue
+                except: pass
+            write_log(f"📤 Автоотчёт с Вчера → {uid} ({cur_hour:02d}:00)")
+            try:
+                rpt = await build_today_report(include_yesterday=True)
+                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                us["last_sent_yesterday"] = f"{cur_date} {cur_hour}"
+                settings[sid] = us
+                await save_settings(settings)
+            except Exception as e:
+                write_log(f"❌ Автоотчёт (Вчера) {uid}: {e}")
+        else:
+            # Ветка обычного отчёта
+            last = us.get("last_sent_regular")
+            if last:
+                try:
+                    ld, lh = last.split()
+                    if ld == cur_date and int(lh) == cur_hour: continue
+                except: pass
+            write_log(f"📤 Обычный автоотчёт → {uid} ({cur_hour:02d}:00)")
+            try:
+                rpt = await build_today_report(include_yesterday=False)
+                await context.bot.send_message(chat_id=uid, text=rpt, parse_mode="Markdown")
+                us["last_sent_regular"] = f"{cur_date} {cur_hour}"
+                settings[sid] = us
+                await save_settings(settings)
+            except Exception as e:
+                write_log(f"❌ Обычный автоотчёт {uid}: {e}")
 
 async def cancel(update, context):
     chat_id = update.effective_chat.id
@@ -2078,6 +2392,7 @@ async def cancel(update, context):
 def main():
     if not validate_env_vars(): sys.exit(1)
     _ensure_data_dir()
+    _init_expense_types_file()
 
     write_log(f"🚀 Запуск (v{VERSION})")
     write_log(f"✅ OZON_CLIENT_ID: {mask_secret(OZON_CLIENT_ID)}")
@@ -2085,6 +2400,7 @@ def main():
     write_log(f"✅ TELEGRAM_BOT_TOKEN: {mask_secret(TELEGRAM_BOT_TOKEN)}")
     write_log(f"✅ ADMIN_CHAT_ID: {ADMIN_CHAT_ID}")
     write_log(f"✅ Data dir: {DATA_DIR}")
+    write_log(f"✅ Справочник расходов: {EXPENSE_TYPES_FILE}")
     update_version_history(VERSION, CHANGELOG_MESSAGE)
 
     app = (Application.builder()
@@ -2097,29 +2413,28 @@ def main():
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
 
-    # Главное меню
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|🔔 Автоматические рассылки|"
-        "⚙️ Администрирование|📖 Справка)$"), handle_main_menu))
+        "⚙️ Администрирование|📚 Справочник расходов|📖 Справка)$"), handle_main_menu))
 
-    # Продажи
+    app.add_handler(MessageHandler(filters.Text(["🔄 Проверить доступ"]), check_access_cmd))
     app.add_handler(MessageHandler(filters.Text(["📅 Продажи за сегодня"]), today_report))
-    app.add_handler(MessageHandler(filters.Text(["📦 Топ товаров за сегодня"]), top_today))
+    app.add_handler(MessageHandler(filters.Text(["📅 Топ товаров за сегодня"]), top_today))
     app.add_handler(MessageHandler(filters.Text(["📋 Список менеджеров"]), admin_list))
 
-    # Автоматические рассылки - маршрутизатор
     app.add_handler(MessageHandler(filters.Regex(
         "^(🕒 Выбор времени рассылок|📅 Добавление отчета за Вчера|"
         "🔕 Режим тишины|📤 Отправить отчет за Вчера сейчас|🔙 Назад)$"), auto_menu_router))
 
-    # Диалоги
+    app.add_handler(CallbackQueryHandler(expense_types_cb, pattern="^et_"))
+
     conv_date = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📅 Выбрать дату"), date_menu)],
+        entry_points=[MessageHandler(filters.Text("📆 Выбрать дату"), date_menu)],
         states={WAITING_DATE_SINGLE: [CallbackQueryHandler(date_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_period = ConversationHandler(
-        entry_points=[MessageHandler(filters.Text("📆 Выбрать период"), period_menu)],
+        entry_points=[MessageHandler(filters.Text("📊 Выбрать период"), period_menu)],
         states={
             WAITING_PERIOD_TYPE: [CallbackQueryHandler(period_type_cb)],
             WAITING_PERIOD_YEAR: [CallbackQueryHandler(period_year_cb)],
@@ -2127,8 +2442,7 @@ def main():
             WAITING_PERIOD_QUARTER: [CallbackQueryHandler(period_quarter_cb)],
             WAITING_PERIOD_START: [CallbackQueryHandler(custom_start_cb)],
             WAITING_PERIOD_END: [CallbackQueryHandler(custom_end_cb)],
-            WAITING_YEAR_SELECT: [CallbackQueryHandler(period_year_cb)],
-        },
+            WAITING_YEAR_SELECT: [CallbackQueryHandler(period_year_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_prod = ConversationHandler(
@@ -2140,8 +2454,7 @@ def main():
             WAITING_PRODUCT_QUARTER: [CallbackQueryHandler(products_quarter_cb)],
             WAITING_PRODUCT_PERIOD_START: [CallbackQueryHandler(products_custom_start)],
             WAITING_PRODUCT_PERIOD_END: [CallbackQueryHandler(products_custom_end)],
-            WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(products_year_cb)],
-        },
+            WAITING_PRODUCT_YEAR_SELECT: [CallbackQueryHandler(products_year_cb)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_dyn = ConversationHandler(
@@ -2150,8 +2463,7 @@ def main():
             WAITING_DYN_SELECT: [CallbackQueryHandler(dynamics_select_cb)],
             WAITING_DYN_YEAR: [CallbackQueryHandler(dynamics_year_cb)],
             WAITING_DYN_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_start)],
-            WAITING_DYN_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)],
-        },
+            WAITING_DYN_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, dynamics_range_end)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_pchart = ConversationHandler(
@@ -2162,8 +2474,7 @@ def main():
             WAITING_PC_PERIOD: [CallbackQueryHandler(product_chart_period_cb)],
             WAITING_PC_YEAR: [CallbackQueryHandler(product_chart_year_cb)],
             WAITING_PC_RANGE_START: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_start)],
-            WAITING_PC_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_end)],
-        },
+            WAITING_PC_RANGE_END: [MessageHandler(filters.TEXT & ~filters.COMMAND, product_chart_range_end)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_sch = ConversationHandler(
@@ -2180,16 +2491,14 @@ def main():
         entry_points=[CallbackQueryHandler(silence_cb, pattern="^sil_")],
         states={
             WAITING_AUTO_SILENCE_START: [CallbackQueryHandler(silence_start_cb, pattern="^sil_s_")],
-            WAITING_AUTO_SILENCE_END: [CallbackQueryHandler(silence_end_cb, pattern="^sil_e_")],
-        },
+            WAITING_AUTO_SILENCE_END: [CallbackQueryHandler(silence_end_cb, pattern="^sil_e_")]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_add = ConversationHandler(
         entry_points=[MessageHandler(filters.Text("➕ Добавить менеджера"), admin_add_start)],
         states={
             WAITING_ADD_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_input)],
-            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_phone)],
-        },
+            WAITING_MANAGER_PHONE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_add_phone)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
     conv_rm = ConversationHandler(
@@ -2197,18 +2506,11 @@ def main():
         states={WAITING_REMOVE_MANAGER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_remove_input)]},
         fallbacks=[CommandHandler("cancel", cancel)])
 
-    app.add_handler(conv_date)
-    app.add_handler(conv_period)
-    app.add_handler(conv_prod)
-    app.add_handler(conv_dyn)
-    app.add_handler(conv_pchart)
-    app.add_handler(conv_sch)
-    app.add_handler(conv_yest)
-    app.add_handler(conv_sil)
-    app.add_handler(conv_add)
-    app.add_handler(conv_rm)
+    app.add_handler(conv_date); app.add_handler(conv_period); app.add_handler(conv_prod)
+    app.add_handler(conv_dyn); app.add_handler(conv_pchart)
+    app.add_handler(conv_sch); app.add_handler(conv_yest); app.add_handler(conv_sil)
+    app.add_handler(conv_add); app.add_handler(conv_rm)
 
-    # Планировщик
     if app.job_queue:
         app.job_queue.run_repeating(check_auto_reports, interval=900, first=10)
         write_log("✅ Планировщик запущен (каждые 15 минут).")
