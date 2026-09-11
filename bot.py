@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.4.9"
-CHANGELOG_MESSAGE = "Правильная логика рассылок: schedule_hours = обычные отчёты, yesterday_report_hours = с блоком Вчера. Раздельные last_sent."
+VERSION = "2.5.1"
+CHANGELOG_MESSAGE = "Кэш финансов по каждому дню (fin_day_). Повторные запросы любых пересекающихся периодов — мгновенные. Прогресс-сообщение при долгой загрузке."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -47,6 +47,8 @@ SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
 EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
+
+AD_CHUNK_DAYS = 60
 
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
@@ -318,7 +320,6 @@ async def save_settings(settings: Dict):
             write_log(f"❌ settings: {e}")
 
 def get_user_settings(settings: Dict, chat_id: int) -> Dict:
-    """Возвращает настройки пользователя. Мигрирует старый last_sent → last_sent_regular."""
     sid = str(chat_id)
     if sid not in settings:
         settings[sid] = {"schedule_hours": [], "yesterday_report_hours": [],
@@ -326,7 +327,6 @@ def get_user_settings(settings: Dict, chat_id: int) -> Dict:
                          "last_sent_regular": None, "last_sent_yesterday": None,
                          "last_reminder": None}
     us = settings[sid]
-    # Миграция со старого формата
     if "last_sent" in us:
         us.setdefault("last_sent_regular", us.get("last_sent"))
         us.setdefault("last_sent_yesterday", None)
@@ -336,7 +336,6 @@ def get_user_settings(settings: Dict, chat_id: int) -> Dict:
     return us
 
 def user_has_schedule(chat_id: int) -> bool:
-    """Настроены ли рассылки. Достаточно schedule_hours."""
     if not os.path.exists(SETTINGS_FILE): return False
     try:
         with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
@@ -524,14 +523,16 @@ async def get_performance_token():
     except Exception as e:
         write_log(f"❌ Токен: {e}"); return None
 
+# ==================== ОТГРУЗКИ ====================
 async def fetch_postings(date_from, date_to):
     cache_key = f"postings_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
-    all_p = []; cursor = ""; LIMIT = 100
+    all_p = []; cursor = ""; LIMIT = 100; page = 0
     while True:
+        page += 1
         payload = {"dir": "ASC", "filter": {"since": since, "to": to},
                    "limit": LIMIT, "translit": False,
                    "with": {"analytics_data": True, "financial_data": True}}
@@ -547,14 +548,14 @@ async def fetch_postings(date_from, date_to):
         if not data.get("has_next"): break
         cursor = data.get("cursor", "")
         if not cursor or len(postings) < LIMIT: break
+        if page % 20 == 0:
+            write_log(f"📦 FBO: загружено {len(all_p)} записей (стр. {page})")
     write_log(f"📦 Отгрузок: {len(all_p)} за {date_from}–{date_to}")
     await save_to_cache(cache_key, all_p)
     return all_p
 
-async def fetch_advertising_expense(date_from, date_to):
-    cache_key = f"ad_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+# ==================== РЕКЛАМА ====================
+async def _fetch_advertising_expense_single(date_from, date_to):
     token = await get_performance_token()
     if not token: return 0.0
     url = "https://api-performance.ozon.ru/api/client/statistics/expense/json"
@@ -571,11 +572,55 @@ async def fetch_advertising_expense(date_from, date_to):
                     if ms is not None:
                         try: total += float(str(ms).replace(",", "."))
                         except: pass
-        await save_to_cache(cache_key, total); return total
+        return total
     except Exception as e:
-        write_log(f"❌ Реклама: {e}"); return 0.0
+        write_log(f"❌ Реклама ({date_from}–{date_to}): {e}")
+        return 0.0
 
+async def fetch_advertising_expense(date_from, date_to):
+    cache_key = f"ad_{date_from}_{date_to}"
+    cached = await get_from_cache(cache_key)
+    if cached is not None: return cached
+
+    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
+    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
+    today = get_moscow_today()
+    if start_dt > today: return 0.0
+    if end_dt > today: end_dt = today
+
+    total_days = (end_dt - start_dt).days + 1
+
+    if total_days <= AD_CHUNK_DAYS:
+        result = await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
+        await save_to_cache(cache_key, result)
+        return result
+
+    total = 0.0
+    chunks_count = (total_days + AD_CHUNK_DAYS - 1) // AD_CHUNK_DAYS
+    write_log(f"📢 Реклама: разбивка {date_from}–{date_to} на {chunks_count} частей по {AD_CHUNK_DAYS} дней")
+    cur = start_dt
+    chunk_idx = 0
+    while cur <= end_dt:
+        chunk_idx += 1
+        chunk_end = min(cur + datetime.timedelta(days=AD_CHUNK_DAYS - 1), end_dt)
+        chunk_from = cur.isoformat()
+        chunk_to = chunk_end.isoformat()
+        write_log(f"📢 Реклама [{chunk_idx}/{chunks_count}]: {chunk_from}–{chunk_to}")
+        part = await _fetch_advertising_expense_single(chunk_from, chunk_to)
+        total += part
+        cur = chunk_end + datetime.timedelta(days=1)
+
+    write_log(f"📢 Реклама: итого {total:.2f} ₽ за {date_from}–{date_to}")
+    await save_to_cache(cache_key, total)
+    return total
+
+# ==================== ФИНАНСЫ (по дням с отдельным кэшем) ====================
 async def fetch_finance_accruals_by_day(date_str):
+    """Загружает начисления за один день. Кэшируется по дню: fin_day_YYYY-MM-DD."""
+    cache_key = f"fin_day_{date_str}"
+    cached = await get_from_cache(cache_key)
+    if cached is not None:
+        return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}; all_a = []
     while True:
@@ -590,9 +635,11 @@ async def fetch_finance_accruals_by_day(date_str):
         last = data.get("last_id")
         if last: payload["last_id"] = last
         else: break
+    await save_to_cache(cache_key, all_a)
     return all_a
 
-async def fetch_finance_transactions(date_from, date_to):
+async def fetch_finance_transactions(date_from, date_to, status_msg=None):
+    """Собирает финансы за период. Каждый день кэшируется отдельно."""
     cache_key = f"fin_{date_from}_{date_to}"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -601,15 +648,36 @@ async def fetch_finance_transactions(date_from, date_to):
     today = get_moscow_today()
     if start > today: return []
     if end > today: end = today
+
     days = []; cur = start
     while cur <= end:
         days.append(cur.isoformat()); cur += datetime.timedelta(days=1)
-    write_log(f"💰 Финансы: {len(days)} дней параллельно")
-    tasks = [fetch_finance_accruals_by_day(d) for d in days]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    all_a = []
-    for i, res in enumerate(results):
-        if isinstance(res, list): all_a.extend(res)
+
+    all_a = []; missing = []
+    for d in days:
+        c = disk_cache_get(f"fin_day_{d}")
+        if c is not None:
+            all_a.extend(c)
+        else:
+            missing.append(d)
+
+    if missing:
+        write_log(f"💰 Финансы: {len(missing)}/{len(days)} дней новых ({date_from}–{date_to})")
+        total = len(missing)
+        for i, d in enumerate(missing):
+            if status_msg and (i % 30 == 0 or i == total - 1):
+                try:
+                    await status_msg.edit_text(
+                        f"⏳ Финансы: загружено {i+1}/{total} дней\n"
+                        f"_(всего {len(days)} дн., {date_from} – {date_to})_",
+                        parse_mode="Markdown")
+                except Exception:
+                    pass
+            day_acc = await fetch_finance_accruals_by_day(d)
+            all_a.extend(day_acc)
+    else:
+        write_log(f"💰 Финансы: все {len(days)} дней из кэша")
+
     write_log(f"💰 Начислений: {len(all_a)}")
     await save_to_cache(cache_key, all_a)
     return all_a
@@ -913,10 +981,10 @@ def format_period_comparison(cur, prev, name):
     return "\n".join(lines)
 
 # ==================== СБОРКА МЕТРИК ====================
-async def get_period_metrics(df, dt):
+async def get_period_metrics(df, dt, status_msg=None):
     postings, ad, fin = await asyncio.gather(
         fetch_postings(df, dt), fetch_advertising_expense(df, dt),
-        fetch_finance_transactions(df, dt))
+        fetch_finance_transactions(df, dt, status_msg=status_msg))
     agg = aggregate_postings_range(postings, df, dt)
     exp = aggregate_finance_expenses(fin)
     osum = agg["ordered_sum"]; dsum = agg["delivered_sum"]
@@ -927,10 +995,6 @@ async def get_period_metrics(df, dt):
 
 # ==================== ОТЧЁТЫ ====================
 async def build_today_report(include_yesterday=False):
-    """
-    include_yesterday=False → обычный отчёт: Сегодня + Текущий месяц + Расходы
-    include_yesterday=True  → отчёт за Вчера: Вчера + Текущий месяц + Расходы
-    """
     now = get_current_time_msk()
     td = now.date(); today = td.isoformat()
     yest = (td - datetime.timedelta(days=1)).isoformat()
@@ -939,7 +1003,6 @@ async def build_today_report(include_yesterday=False):
     dp = (td - cm).days + 1
     pm_e = pm + datetime.timedelta(days=dp - 1); pm_e_s = pm_e.isoformat()
 
-    # Всегда загружаем всё нужное
     postings_cur, postings_prev, ad_t, ad_y, ad_m, ad_pm, fin_t, fin_m = await asyncio.gather(
         fetch_postings(cm_s, today), fetch_postings(pm_s, pm_e_s),
         fetch_advertising_expense(today, today), fetch_advertising_expense(yest, yest),
@@ -1047,10 +1110,38 @@ async def build_today_report(include_yesterday=False):
     parts.append(format_expense_block(exp_m, "Расходы за текущий месяц"))
     return header + "\n\n\n" + "\n\n".join(parts)
 
-async def build_period_report(df, dt, name):
+async def build_period_report(df, dt, name, status_msg=None):
     pf, pt = prev_period(df, dt)
     write_log(f"📊 Период {df}–{dt}, предыдущий {pf}–{pt}")
-    cur, prev = await asyncio.gather(get_period_metrics(df, dt), get_period_metrics(pf, pt))
+
+    # Проверяем недостающие дни финансов для обоих периодов
+    missing_days = set()
+    for d_from, d_to in [(df, dt), (pf, pt)]:
+        cur_d = datetime.datetime.strptime(d_from, "%Y-%m-%d").date()
+        end_d = datetime.datetime.strptime(d_to, "%Y-%m-%d").date()
+        today = get_moscow_today()
+        if cur_d > today: continue
+        if end_d > today: end_d = today
+        while cur_d <= end_d:
+            key = f"fin_day_{cur_d.isoformat()}"
+            if disk_cache_get(key) is None:
+                missing_days.add(cur_d.isoformat())
+            cur_d += datetime.timedelta(days=1)
+
+    if missing_days and status_msg:
+        est_min_low = len(missing_days) * 2 // 60
+        est_min_high = len(missing_days) * 3 // 60
+        try:
+            await status_msg.edit_text(
+                f"⏳ Загрузка финансов: {len(missing_days)} дней\n"
+                f"_Ориентировочно {est_min_low}–{est_min_high} мин. Это первый запрос периода._",
+                parse_mode="Markdown")
+        except Exception:
+            pass
+
+    cur, prev = await asyncio.gather(
+        get_period_metrics(df, dt, status_msg=status_msg),
+        get_period_metrics(pf, pt, status_msg=status_msg))
     return format_period_comparison(cur, prev, name)
 
 # ==================== КАЛЕНДАРЬ ====================
@@ -1305,12 +1396,12 @@ async def send_help(update, context):
         "• 📊 Отчёт по продажам – актуальная сводка за сегодня и текущий месяц.\n"
         "• 📦 Отчёт по товарам – топ товаров по выручке.\n"
         "• 📆 Выбрать дату – данные за конкретный день.\n"
-        "• 📊 Выбрать период – месяц/квартал/год/произвольный.\n"
+        "• 📊 Выбрать период – месяц/квартал/год/произвольный (до года за раз).\n"
         "• 📈 Динамика продаж – график доставленных заказов по месяцам.\n"
         "• 📈 Динамика по товару – график продаж конкретного товара.\n"
         "• 🔔 Автоматические рассылки – персональная настройка.\n\n"
         "🔹 *Автоматические отчёты (персональные)*\n"
-        "• 🕒 Выбор времени рассылок – общие часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
+        "• 🕒 Выбор времени рассылок – часы, когда отправляется обычный отчёт (Сегодня + Текущий месяц).\n"
         "• 📅 Добавление отчёта за Вчера – часы из выбранных, когда отправляется отчёт с блоком «Вчера».\n"
         "• 🔕 Режим тишины – интервал, когда рассылки не отправляются.\n"
         "• 📤 Отправить сейчас – принудительная отправка отчёта за Вчера.\n\n"
@@ -1318,9 +1409,9 @@ async def send_help(update, context):
         "• 🛒 Заказано / 📦 Доставлено / ❌ Отменено – суммы и шт.\n"
         "• 📢 Реклама – расходы, ДРР (общий) и ДРР (по доставленным).\n"
         "• 💰 Расходы (финансовые) – разбивка по услугам.\n\n"
-        "🔹 *Сравнение*\n"
-        "• «Сегодня» – с аналогичным временем вчера.\n"
-        "• «Текущий месяц» – с аналогичным периодом предыдущего.\n\n"
+        "🔹 *Длительные периоды*\n"
+        "• Первый запрос за период может занять 5–15 минут (365 дней финансов).\n"
+        "• Повторные запросы пересекающихся периодов — мгновенные (кэш по дням).\n\n"
         "🔹 *Часовой пояс*\n"
         "• Все расчёты – по московскому времени (МСК, UTC+3).\n\n"
     )
@@ -1379,13 +1470,13 @@ async def date_cb(update, context):
             ok, r = validate_date(ds)
             if not ok:
                 await q.edit_message_text(r); return WAITING_DATE_SINGLE
-            await q.edit_message_text(f"⏳ Данные за {ds}...")
+            status_msg = await q.message.reply_text(f"⏳ Данные за {ds}...")
             try:
-                rpt = await build_period_report(ds, ds, ds)
-                await q.edit_message_text(rpt, parse_mode="Markdown")
+                rpt = await build_period_report(ds, ds, ds, status_msg=status_msg)
+                await status_msg.edit_text(rpt, parse_mode="Markdown")
                 await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
             return ConversationHandler.END
     return WAITING_DATE_SINGLE
 
@@ -1449,13 +1540,14 @@ async def period_year_cb(update, context):
     if d.startswith("pyy_"):
         y = int(d.split("_")[1])
         df = datetime.date(y,1,1).isoformat(); dt = datetime.date(y,12,31).isoformat()
-        await q.edit_message_text(f"⏳ За {y} год...")
+        await q.delete_message()
+        status_msg = await q.message.reply_text(f"⏳ За {y} год. Первый запрос может занять до 15 минут...")
         try:
-            rpt = await build_period_report(df, dt, f"{y} год")
-            await q.edit_message_text(rpt, parse_mode="Markdown")
+            rpt = await build_period_report(df, dt, f"{y} год", status_msg=status_msg)
+            await status_msg.edit_text(rpt, parse_mode="Markdown")
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_YEAR
 
@@ -1470,13 +1562,13 @@ async def period_month_cb(update, context):
         f = datetime.date(y,m,1)
         l = datetime.date(y,12,31) if m==12 else datetime.date(y,m+1,1)-datetime.timedelta(days=1)
         name = f"{MONTH_NAMES[m-1]} {y}"
-        await q.edit_message_text(f"⏳ За {name}...")
+        status_msg = await q.message.reply_text(f"⏳ За {name}...")
         try:
-            rpt = await build_period_report(f.isoformat(), l.isoformat(), name)
-            await q.edit_message_text(rpt, parse_mode="Markdown")
+            rpt = await build_period_report(f.isoformat(), l.isoformat(), name, status_msg=status_msg)
+            await status_msg.edit_text(rpt, parse_mode="Markdown")
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_MONTH
 
@@ -1492,13 +1584,13 @@ async def period_quarter_cb(update, context):
         f = datetime.date(y, sm, 1)
         l = datetime.date(y,12,31) if em==12 else datetime.date(y,em+1,1)-datetime.timedelta(days=1)
         name = f"{qn} квартал {y}"
-        await q.edit_message_text(f"⏳ За {name}...")
+        status_msg = await q.message.reply_text(f"⏳ За {name}...")
         try:
-            rpt = await build_period_report(f.isoformat(), l.isoformat(), name)
-            await q.edit_message_text(rpt, parse_mode="Markdown")
+            rpt = await build_period_report(f.isoformat(), l.isoformat(), name, status_msg=status_msg)
+            await status_msg.edit_text(rpt, parse_mode="Markdown")
             await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PERIOD_QUARTER
 
@@ -1559,13 +1651,14 @@ async def custom_end_cb(update, context):
             if not ok:
                 await q.edit_message_text(r); return WAITING_PERIOD_END
             nm = f"{ds} – {de}"
-            await q.edit_message_text(f"⏳ За {nm}...")
+            await q.delete_message()
+            status_msg = await q.message.reply_text(f"⏳ За {nm}. Первый запрос может занять до 15 минут...")
             try:
-                rpt = await build_period_report(ds, de, nm)
-                await q.edit_message_text(rpt, parse_mode="Markdown")
+                rpt = await build_period_report(ds, de, nm, status_msg=status_msg)
+                await status_msg.edit_text(rpt, parse_mode="Markdown")
                 await q.message.reply_text("Выберите действие:", reply_markup=sales_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
             context.user_data.pop('p_start', None)
             return ConversationHandler.END
     return WAITING_PERIOD_END
@@ -1634,15 +1727,15 @@ async def products_year_cb(update, context):
     if d.startswith("tyy_"):
         y = int(d.split("_")[1])
         df = datetime.date(y,1,1).isoformat(); dt = datetime.date(y,12,31).isoformat()
-        await q.edit_message_text(f"⏳ Товары за {y} год...")
+        status_msg = await q.message.reply_text(f"⏳ Товары за {y} год...")
         try:
             postings = await fetch_postings(df, dt)
             stats = aggregate_products(postings, df, dt)
             txt = format_top_products(stats, f"Товары за {y} год", 20) + "\n" + format_products_summary(stats)
-            await q.edit_message_text(txt)
+            await status_msg.edit_text(txt)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_YEAR
 
@@ -1657,15 +1750,15 @@ async def products_month_cb(update, context):
         f = datetime.date(y,m,1)
         l = datetime.date(y,12,31) if m==12 else datetime.date(y,m+1,1)-datetime.timedelta(days=1)
         nm = f"{MONTH_NAMES[m-1]} {y}"
-        await q.edit_message_text(f"⏳ Товары за {nm}...")
+        status_msg = await q.message.reply_text(f"⏳ Товары за {nm}...")
         try:
             postings = await fetch_postings(f.isoformat(), l.isoformat())
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-            await q.edit_message_text(txt)
+            await status_msg.edit_text(txt)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_MONTH
 
@@ -1681,15 +1774,15 @@ async def products_quarter_cb(update, context):
         f = datetime.date(y, sm, 1)
         l = datetime.date(y,12,31) if em==12 else datetime.date(y,em+1,1)-datetime.timedelta(days=1)
         nm = f"{qn} квартал {y}"
-        await q.edit_message_text(f"⏳ Товары за {nm}...")
+        status_msg = await q.message.reply_text(f"⏳ Товары за {nm}...")
         try:
             postings = await fetch_postings(f.isoformat(), l.isoformat())
             stats = aggregate_products(postings, f.isoformat(), l.isoformat())
             txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-            await q.edit_message_text(txt)
+            await status_msg.edit_text(txt)
             await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
         except Exception as e:
-            write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+            write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
         return ConversationHandler.END
     return WAITING_PRODUCT_QUARTER
 
@@ -1750,15 +1843,15 @@ async def products_custom_end(update, context):
             if not ok:
                 await q.edit_message_text(r); return WAITING_PRODUCT_PERIOD_END
             nm = f"{ds} – {de}"
-            await q.edit_message_text(f"⏳ Товары за {nm}...")
+            status_msg = await q.message.reply_text(f"⏳ Товары за {nm}...")
             try:
                 postings = await fetch_postings(ds, de)
                 stats = aggregate_products(postings, ds, de)
                 txt = format_top_products(stats, f"Товары за {nm}", 20) + "\n" + format_products_summary(stats)
-                await q.edit_message_text(txt)
+                await status_msg.edit_text(txt)
                 await q.message.reply_text("Выберите действие:", reply_markup=products_reports_kb())
             except Exception as e:
-                write_log(f"❌ {e}"); await q.edit_message_text(f"❌ {e}")
+                write_log(f"❌ {e}"); await status_msg.edit_text(f"❌ {e}")
             context.user_data.pop('tp_start', None)
             return ConversationHandler.END
     return WAITING_PRODUCT_PERIOD_END
@@ -2109,7 +2202,6 @@ async def schedule_cb(update, context):
         settings = await load_settings()
         us = get_user_settings(settings, chat_id)
         us["schedule_hours"] = temp
-        # Удаляем из yesterday_report_hours часы, которых больше нет в schedule_hours
         us["yesterday_report_hours"] = [h for h in us.get("yesterday_report_hours", []) if h in temp]
         settings[str(chat_id)] = us
         await save_settings(settings)
@@ -2295,19 +2387,10 @@ async def admin_list(update, context):
 
 # ==================== ПЛАНИРОВЩИК ====================
 async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
-    """
-    Логика:
-    - schedule_hours = общие часы (обычный отчёт).
-    - yesterday_report_hours ⊆ schedule_hours (отчёт с блоком Вчера).
-    - В час, который в yesterday_report_hours → отправляем отчёт с Вчера.
-    - В остальные часы из schedule_hours → отправляем обычный отчёт.
-    - last_sent_regular и last_sent_yesterday — независимые ключи.
-    """
     now = datetime.datetime.now(MOSCOW_TZ)
     cur_hour = now.hour; cur_date = now.strftime("%Y-%m-%d")
     settings = await load_settings()
 
-    # 1) Напоминание в 12:00 (только если schedule_hours пуст)
     if cur_hour == 12:
         recipients = [ADMIN_CHAT_ID] + [m["id"] for m in load_managers()]
         for uid in set(recipients):
@@ -2329,7 +2412,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
                 write_log(f"⚠️ Не отправлено {uid}: {e}")
         await save_settings(settings)
 
-    # 2) Рассылки
     for sid, us in settings.items():
         try: uid = int(sid)
         except: continue
@@ -2338,7 +2420,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
         if not sch: continue
         if cur_hour not in sch: continue
 
-        # Режим тишины
         s = us.get("silence_start"); e = us.get("silence_end")
         if s is not None and e is not None:
             if s < e:
@@ -2349,7 +2430,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
         yest_hours = us.get("yesterday_report_hours", [])
 
         if cur_hour in yest_hours:
-            # Ветка «с блоком Вчера»
             last = us.get("last_sent_yesterday")
             if last:
                 try:
@@ -2366,7 +2446,6 @@ async def check_auto_reports(context: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 write_log(f"❌ Автоотчёт (Вчера) {uid}: {e}")
         else:
-            # Ветка обычного отчёта
             last = us.get("last_sent_regular")
             if last:
                 try:
