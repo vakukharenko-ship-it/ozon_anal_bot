@@ -29,8 +29,8 @@ from telegram.warnings import PTBUserWarning
 
 warnings.filterwarnings("ignore", category=PTBUserWarning)
 
-VERSION = "2.7.3"
-CHANGELOG_MESSAGE = "Исправлена обрезка длинных сообщений в Telegram (окончательно): сменён ключ кэша отчётов по рекламе (_v2 -> _v3), из-за чего старые обрезанные отчёты больше не подставляются. Добавлена команда /clearcache для сброса кэша вручную."
+VERSION = "2.8.2"
+CHANGELOG_MESSAGE = "Исправлена загрузка справочника начислений Ozon: улучшена обработка ответа, добавлено подробное логирование. Fallback-названия теперь используют категории вместо '(type XX)'. Добавлена возможность ручного заполнения /app/data/accrual_types.json."
 
 # ==================== КОНСТАНТЫ ====================
 API_TIMEOUT = 60
@@ -40,16 +40,18 @@ POSTINGS_RATE = 0.5
 FINANCE_RATE = 0.5
 PERFORMANCE_RATE = 1.0
 CACHE_TTL_SECONDS = 3600
+ACCRUAL_TYPES_TTL = 86400
 DATA_DIR = "/app/data"
 DISK_CACHE_DIR = "/app/data/cache"
 VERSION_HISTORY_FILE = "/app/data/version_history.json"
 SETTINGS_FILE = "/app/data/settings.json"
 MANAGERS_FILE = "/app/data/managers.json"
 EXPENSE_TYPES_FILE = "/app/data/expense_types.json"
+ACCRUAL_TYPES_FILE = "/app/data/accrual_types.json"
 LOG_FILE = "/app/data/ozon_log.txt"
 
 AD_CHUNK_DAYS = 60
-TELEGRAM_MAX_LEN = 4000  # безопасный лимит (у Telegram 4096)
+TELEGRAM_MAX_LEN = 4000
 
 WAITING_DATE_SINGLE = 1
 WAITING_PERIOD_TYPE = 2
@@ -116,6 +118,7 @@ _api_cache = {}
 _cache_timestamps = {}
 _settings_lock = asyncio.Lock()
 _expense_types_cache = None
+_accrual_types_cache = None
 
 OZON_CLIENT_ID = os.getenv("OZON_CLIENT_ID")
 OZON_API_KEY = os.getenv("OZON_API_KEY")
@@ -127,6 +130,7 @@ ADMIN_CHAT_ID = int(ADMIN_CHAT_ID_STR) if ADMIN_CHAT_ID_STR and ADMIN_CHAT_ID_ST
 
 OZON_POSTING_FBO_URL = "https://api-seller.ozon.ru/v3/posting/fbo/list"
 OZON_FINANCE_ACCRUAL_BY_DAY_URL = "https://api-seller.ozon.ru/v1/finance/accrual/by-day"
+OZON_FINANCE_ACCRUAL_TYPES_URL = "https://api-seller.ozon.ru/v1/finance/accrual/types"
 
 MOSCOW_TZ = datetime.timezone(datetime.timedelta(hours=3))
 
@@ -241,27 +245,123 @@ def get_expense_types():
         _expense_types_cache = _load_expense_types_sync()
     return _expense_types_cache
 
+# ==================== СПРАВОЧНИК НАЧИСЛЕНИЙ OZON ====================
+def _load_accrual_types_sync():
+    if not os.path.exists(ACCRUAL_TYPES_FILE): return {}
+    try:
+        with open(ACCRUAL_TYPES_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        write_log(f"⚠️ Чтение accrual_types: {e}"); return {}
+
+def _save_accrual_types_sync(data):
+    try:
+        os.makedirs(os.path.dirname(ACCRUAL_TYPES_FILE), exist_ok=True)
+        with open(ACCRUAL_TYPES_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        write_log(f"❌ Запись accrual_types: {e}")
+
+async def fetch_accrual_types():
+    """Загружает справочник начислений из Ozon API. Кэширует на сутки.
+    Если API недоступен, пытается использовать локальный файл."""
+    global _accrual_types_cache
+    if _accrual_types_cache is not None:
+        return _accrual_types_cache
+    cached = _load_accrual_types_sync()
+    if cached:
+        _accrual_types_cache = cached
+        try:
+            mtime = os.path.getmtime(ACCRUAL_TYPES_FILE)
+            if time.time() - mtime < ACCRUAL_TYPES_TTL:
+                write_log(f"📚 Справочник начислений из файла ({len(cached)} типов)")
+                return _accrual_types_cache
+        except Exception:
+            pass
+    headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY,
+               "Content-Type": "application/json"}
+    payload = {}
+    try:
+        data = await api_request_with_retry(OZON_FINANCE_ACCRUAL_TYPES_URL, headers,
+                                            payload, method='POST', kind='finance')
+        types_list = []
+        # Поддерживаем несколько возможных структур ответа
+        if isinstance(data, dict):
+            if "types" in data:
+                types_list = data["types"]
+            elif "result" in data:
+                res = data["result"]
+                if isinstance(res, dict) and "types" in res:
+                    types_list = res["types"]
+                elif isinstance(res, list):
+                    types_list = res
+            elif "accrual_types" in data:
+                types_list = data["accrual_types"]
+        elif isinstance(data, list):
+            types_list = data
+        result = {}
+        for item in types_list:
+            if isinstance(item, dict):
+                tid = str(item.get("id", item.get("type_id", "")))
+                name = item.get("name", item.get("title", ""))
+                if tid and name:
+                    result[tid] = name
+        if result:
+            _accrual_types_cache = result
+            _save_accrual_types_sync(result)
+            write_log(f"✅ Справочник начислений Ozon загружен ({len(result)} типов)")
+        else:
+            write_log(f"⚠️ Ozon вернул пустой справочник начислений. Ответ: {str(data)[:300]}")
+        return result
+    except Exception as e:
+        write_log(f"❌ Ошибка загрузки справочника начислений: {e}")
+        # Пробуем использовать локальный файл
+        if _accrual_types_cache is None:
+            _accrual_types_cache = _load_accrual_types_sync()
+        return _accrual_types_cache if _accrual_types_cache is not None else {}
+
+def get_accrual_type_name(type_id):
+    if type_id is None:
+        return None
+    tid = str(type_id)
+    if _accrual_types_cache and tid in _accrual_types_cache:
+        return _accrual_types_cache[tid]
+    cached = _load_accrual_types_sync()
+    if cached and tid in cached:
+        return cached[tid]
+    return None
+
 def type_name(type_id, category_code):
     if type_id is None:
         return CATEGORY_FALLBACK.get(category_code, "Услуги")
     tid = str(type_id)
+    official = get_accrual_type_name(tid)
+    if official:
+        return official
     data = get_expense_types()
     if tid in data:
         entry = data[tid]
         if isinstance(entry, dict):
-            return entry.get("name", f"❓ Неизвестно (type {tid})")
-        return entry
+            name = entry.get("name", "")
+            # Если в локальном справочнике название вида "(type XX)" или "❓", используем категорийный fallback
+            if name and not name.startswith("❓") and "(type " not in name:
+                return name
+        elif not str(entry).startswith("❓") and "(type " not in str(entry):
+            return str(entry)
+    # Категорийный fallback — человеческое название без "(type XX)"
     fallback = CATEGORY_FALLBACK.get(category_code, "Услуги")
-    placeholder = f"{fallback} (type {tid})"
-    data[tid] = {"name": placeholder, "count": 0, "sum": 0.0}
+    # Сохраняем для будущего использования, но уже с чистым названием
+    data[tid] = {"name": fallback, "count": 0, "sum": 0.0}
     _save_expense_types_sync(data)
-    return placeholder
+    return fallback
 
 def register_expense_hit(type_id, amount):
     if type_id is None: return
     tid = str(type_id)
     data = get_expense_types()
-    if tid not in data: return
+    if tid not in data:
+        name = get_accrual_type_name(tid) or CATEGORY_FALLBACK.get("ITEM", "Услуги")
+        data[tid] = {"name": name, "count": 0, "sum": 0.0}
     entry = data[tid]
     if not isinstance(entry, dict):
         entry = {"name": entry, "count": 0, "sum": 0.0}
@@ -314,10 +414,10 @@ async def save_to_cache(key, value):
     disk_cache_set(key, value)
 
 def clear_all_cache():
-    """Полный сброс дискового и in-memory кэша."""
-    global _api_cache, _cache_timestamps
+    global _api_cache, _cache_timestamps, _accrual_types_cache
     _api_cache = {}
     _cache_timestamps = {}
+    _accrual_types_cache = None
     try:
         if os.path.isdir(DISK_CACHE_DIR):
             for f in os.listdir(DISK_CACHE_DIR):
@@ -449,6 +549,13 @@ def indicator(value_current, value_prev, better_is_higher):
         return "🟢" if delta > 0 else ("🔴" if delta < 0 else "")
     return "🟢" if delta < 0 else ("🔴" if delta > 0 else "")
 
+def _range_includes_today(date_from: str, date_to: str) -> bool:
+    try:
+        today = get_moscow_today().isoformat()
+        return date_from <= today <= date_to
+    except Exception:
+        return False
+
 def validate_date(date_str):
     try:
         d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
@@ -478,7 +585,6 @@ def prev_period(df, dt):
 
 # ==================== РАЗБИВКА ДЛИННЫХ СООБЩЕНИЙ ====================
 def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
-    """Разбивает длинный текст на части по max_len символов, сохраняя переносы строк."""
     if not text:
         return [""]
     if len(text) <= max_len:
@@ -503,8 +609,6 @@ def split_message(text: str, max_len: int = TELEGRAM_MAX_LEN) -> List[str]:
     return parts
 
 async def _safe_edit(msg, text, parse_mode="Markdown"):
-    """Редактирует сообщение. Если текст длинный — редактирует первой частью,
-    остальные части отправляет отдельными сообщениями."""
     chunks = split_message(text)
     first = chunks[0]
     edited = False
@@ -611,7 +715,8 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404: write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -623,7 +728,8 @@ async def api_request_with_retry(url, headers, payload=None, method='POST', kind
                             w = API_RETRY_DELAY * (2 ** attempt)
                             await asyncio.sleep(w); continue
                         if resp.status >= 400:
-                            if not silent_404: write_log(f"❌ API {resp.status}: {body[:300]}")
+                            if not silent_404:
+                                write_log(f"❌ API {resp.status} {url}: {body[:300]}")
                             raise aiohttp.ClientResponseError(resp.request_info, resp.history,
                                 status=resp.status, message=body[:200])
                         return json.loads(body)
@@ -648,10 +754,7 @@ async def get_performance_token():
         write_log(f"❌ Токен: {e}"); return None
 
 # ==================== ОТГРУЗКИ ====================
-async def fetch_postings(date_from, date_to):
-    cache_key = f"postings_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+async def _fetch_postings_raw(date_from, date_to):
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     since = f"{date_from}T00:00:00Z"; to = f"{date_to}T23:59:59Z"
     all_p = []; cursor = ""; LIMIT = 100; page = 0
@@ -672,8 +775,34 @@ async def fetch_postings(date_from, date_to):
         if not data.get("has_next"): break
         cursor = data.get("cursor", "")
         if not cursor or len(postings) < LIMIT: break
-    await save_to_cache(cache_key, all_p)
     return all_p
+
+async def fetch_postings(date_from, date_to):
+    today = get_moscow_today()
+    today_iso = today.isoformat()
+    if date_to < today_iso:
+        cache_key = f"postings_{date_from}_{date_to}"
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
+        all_p = await _fetch_postings_raw(date_from, date_to)
+        await save_to_cache(cache_key, all_p)
+        return all_p
+    if date_from > today_iso:
+        return []
+    result = []
+    if date_from < today_iso:
+        yest_iso = (today - datetime.timedelta(days=1)).isoformat()
+        cache_key = f"postings_{date_from}_{yest_iso}"
+        cached = await get_from_cache(cache_key)
+        if cached is not None:
+            result.extend(cached)
+        else:
+            hist = await _fetch_postings_raw(date_from, yest_iso)
+            await save_to_cache(cache_key, hist)
+            result.extend(hist)
+    today_data = await _fetch_postings_raw(today_iso, today_iso)
+    result.extend(today_data)
+    return result
 
 # ==================== РЕКЛАМА (общая сумма) ====================
 async def _fetch_advertising_expense_single(date_from, date_to):
@@ -698,20 +827,11 @@ async def _fetch_advertising_expense_single(date_from, date_to):
         write_log(f"❌ Реклама ({date_from}–{date_to}): {e}")
         return 0.0
 
-async def fetch_advertising_expense(date_from, date_to):
-    cache_key = f"ad_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+async def _fetch_advertising_expense_chunked(date_from, end_dt):
     start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
-    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
-    today = get_moscow_today()
-    if start_dt > today: return 0.0
-    if end_dt > today: end_dt = today
     total_days = (end_dt - start_dt).days + 1
     if total_days <= AD_CHUNK_DAYS:
-        result = await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
-        await save_to_cache(cache_key, result)
-        return result
+        return await _fetch_advertising_expense_single(date_from, end_dt.isoformat())
     total = 0.0
     cur = start_dt
     while cur <= end_dt:
@@ -719,14 +839,44 @@ async def fetch_advertising_expense(date_from, date_to):
         part = await _fetch_advertising_expense_single(cur.isoformat(), chunk_end.isoformat())
         total += part
         cur = chunk_end + datetime.timedelta(days=1)
-    await save_to_cache(cache_key, total)
+    return total
+
+async def fetch_advertising_expense(date_from, date_to):
+    start_dt = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
+    end_dt = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
+    today = get_moscow_today()
+    if start_dt > today: return 0.0
+    if end_dt > today: end_dt = today
+    if end_dt < today:
+        cache_key = f"ad_{date_from}_{date_to}"
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
+        result = await _fetch_advertising_expense_chunked(date_from, end_dt)
+        await save_to_cache(cache_key, result)
+        return result
+    total = 0.0
+    if start_dt < today:
+        yest = today - datetime.timedelta(days=1)
+        cache_key = f"ad_{date_from}_{yest.isoformat()}"
+        cached = await get_from_cache(cache_key)
+        if cached is not None:
+            total += cached
+        else:
+            part = await _fetch_advertising_expense_chunked(date_from, yest)
+            await save_to_cache(cache_key, part)
+            total += part
+    today_part = await _fetch_advertising_expense_single(today.isoformat(), today.isoformat())
+    total += today_part
     return total
 
 # ==================== ФИНАНСЫ ====================
 async def fetch_finance_accruals_by_day(date_str):
+    today_iso = get_moscow_today().isoformat()
+    is_today = (date_str == today_iso)
     cache_key = f"fin_day_{date_str}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+    if not is_today:
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
     headers = {"Client-Id": OZON_CLIENT_ID, "Api-Key": OZON_API_KEY, "Content-Type": "application/json"}
     payload = {"date": date_str}; all_a = []
     while True:
@@ -741,23 +891,30 @@ async def fetch_finance_accruals_by_day(date_str):
         last = data.get("last_id")
         if last: payload["last_id"] = last
         else: break
-    await save_to_cache(cache_key, all_a)
+    if not is_today:
+        await save_to_cache(cache_key, all_a)
     return all_a
 
 async def fetch_finance_transactions(date_from, date_to, status_msg=None):
-    cache_key = f"fin_{date_from}_{date_to}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
     start = datetime.datetime.strptime(date_from, "%Y-%m-%d").date()
     end = datetime.datetime.strptime(date_to, "%Y-%m-%d").date()
     today = get_moscow_today()
     if start > today: return []
     if end > today: end = today
+    includes_today = (end == today)
+    cache_key = f"fin_{date_from}_{date_to}"
+    if not includes_today:
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
     days = []; cur = start
     while cur <= end:
         days.append(cur.isoformat()); cur += datetime.timedelta(days=1)
+    today_iso = today.isoformat()
     all_a = []; missing = []
     for d in days:
+        if d == today_iso:
+            missing.append(d)
+            continue
         c = disk_cache_get(f"fin_day_{d}")
         if c is not None: all_a.extend(c)
         else: missing.append(d)
@@ -773,7 +930,8 @@ async def fetch_finance_transactions(date_from, date_to, status_msg=None):
                 except Exception: pass
             day_acc = await fetch_finance_accruals_by_day(d)
             all_a.extend(day_acc)
-    await save_to_cache(cache_key, all_a)
+    if not includes_today:
+        await save_to_cache(cache_key, all_a)
     return all_a
 
 # ==================== АГРЕГАЦИЯ ФИНАНСОВ ====================
@@ -894,9 +1052,11 @@ def build_sku_offer_map(postings_list):
 
 # ==================== ГРАФИКИ ПРОДАЖ ====================
 async def get_monthly_delivered_sum(year):
+    is_current_year = (year == get_moscow_today().year)
     cache_key = f"monthly_delivered_{year}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+    if not is_current_year:
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
     start = datetime.date(year, 1, 1).isoformat()
     end = datetime.date(year, 12, 31).isoformat()
     postings = await fetch_postings(start, end)
@@ -915,7 +1075,8 @@ async def get_monthly_delivered_sum(year):
             if not isinstance(prod, dict): continue
             q = int(prod.get("quantity", 0))
             monthly[idx] += parse_price(prod) * q
-    await save_to_cache(cache_key, monthly)
+    if not is_current_year:
+        await save_to_cache(cache_key, monthly)
     return monthly
 
 async def generate_sales_chart(years):
@@ -937,10 +1098,13 @@ async def generate_sales_chart(years):
 
 async def generate_product_chart(sku, metric, years):
     cache_key = f"product_chart_{sku}_{metric}_{'_'.join(str(y) for y in years)}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None:
-        data = {int(y): vals for y, vals in cached.items()}
-    else:
+    includes_current_year = get_moscow_today().year in years
+    data = None
+    if not includes_current_year:
+        cached = await get_from_cache(cache_key)
+        if cached is not None:
+            data = {int(y): vals for y, vals in cached.items()}
+    if data is None:
         data = {}
         for y in years:
             start = datetime.date(y, 1, 1).isoformat()
@@ -972,7 +1136,8 @@ async def generate_product_chart(sku, metric, years):
             if metric == "avg_check":
                 monthly = [(monthly[i] / counts[i]) if counts[i] > 0 else 0.0 for i in range(12)]
             data[y] = monthly
-        await save_to_cache(cache_key, {str(y): v for y, v in data.items()})
+        if not includes_current_year:
+            await save_to_cache(cache_key, {str(y): v for y, v in data.items()})
     fig, ax = plt.subplots(figsize=(10, 6))
     months = [datetime.date(2000, m, 1) for m in range(1, 13)]
     ylabel = METRIC_LABELS.get(metric, "Значение")
@@ -1047,9 +1212,11 @@ async def ad_fetch_campaign_objects(token, campaign_id: str) -> List[str]:
 
 async def ad_fetch_stats_chunk(token, campaign_ids: List[str], date_from: str, date_to: str) -> List[Dict]:
     if not campaign_ids: return []
+    includes_today = _range_includes_today(date_from, date_to)
     cache_key = f"perf_stats_{date_from}_{date_to}_{'_'.join(sorted(campaign_ids))[:80]}"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+    if not includes_today:
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
     headers = {"Authorization": f"Bearer {token}"}
     base = "https://api-performance.ozon.ru/api/client/statistics/campaign/product/json"
     parts = [f"dateFrom={date_from}", f"dateTo={date_to}"]
@@ -1059,7 +1226,8 @@ async def ad_fetch_stats_chunk(token, campaign_ids: List[str], date_from: str, d
     try:
         data = await api_request_with_retry(url, headers, method='GET', kind='perf')
         rows = data.get("rows", []) if isinstance(data, dict) else []
-        await save_to_cache(cache_key, rows)
+        if not includes_today:
+            await save_to_cache(cache_key, rows)
         return rows
     except Exception as e:
         write_log(f"❌ Статистика рекламы ({date_from}–{date_to}): {e}")
@@ -1284,7 +1452,6 @@ def ad_build_report(cur_total, prev_total, cur_camps, prev_camps,
         lines.append(Lc("CTR, %", "ctr", ad_fmt_pct, True))
         lines.append("")
 
-    # БЕЗ ОБРЕЗКИ: длинный текст будет разбит функцией split_message
     return "\n".join(lines)
 
 async def _get_all_campaign_data(token, status_msg=None):
@@ -1303,7 +1470,6 @@ async def _get_all_campaign_data(token, status_msg=None):
     return campaigns, skus_by_campaign
 
 async def build_ad_report_month(status_msg=None):
-    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
     cache_key = f"ad_report_month_{get_moscow_today().isoformat()}_v3"
     cached = await get_from_cache(cache_key)
     if cached is not None: return cached
@@ -1341,10 +1507,11 @@ async def build_ad_report_month(status_msg=None):
     return report
 
 async def build_ad_report_period(date_from: str, date_to: str, period_name: str, status_msg=None):
-    # ВАЖНО: ключ кэша содержит _v3 — старые обрезанные отчёты _v2 больше не подтянутся
+    includes_today = _range_includes_today(date_from, date_to)
     cache_key = f"ad_report_{date_from}_{date_to}_v3"
-    cached = await get_from_cache(cache_key)
-    if cached is not None: return cached
+    if not includes_today:
+        cached = await get_from_cache(cache_key)
+        if cached is not None: return cached
     if status_msg: await _safe_edit(status_msg, "⏳ Загружаю токен...")
     token = await get_performance_token()
     if not token: return "❌ Не удалось получить токен Performance API"
@@ -1368,7 +1535,8 @@ async def build_ad_report_period(date_from: str, date_to: str, period_name: str,
     prev_camps = ad_aggregate_by_campaign(prev_rows, skus_by_campaign, prev_postings, sku_offer_map)
     report = ad_build_report(cur_total, prev_total, cur_camps, prev_camps, period_name, has_prev,
                             sku_offer_map, header="📊 *Реклама за период")
-    await save_to_cache(cache_key, report)
+    if not includes_today:
+        await save_to_cache(cache_key, report)
     return report
 
 # ========== Динамика по рекламе ==========
@@ -1882,6 +2050,26 @@ async def clearcache_command(update, context):
         write_log(f"❌ clearcache: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+async def accrual_types_command(update, context):
+    chat_id = update.effective_chat.id
+    if not is_admin(chat_id):
+        await update.message.reply_text("⛔ Только для администратора.")
+        return
+    types = await fetch_accrual_types()
+    if not types:
+        await update.message.reply_text(
+            "❌ Не удалось загрузить справочник начислений.\n\n"
+            "Проверьте лог `/app/data/ozon_log.txt` — там указана точная причина.\n\n"
+            "Вы также можете заполнить файл `/app/data/accrual_types.json` вручную:\n"
+            '```json\n{"41": "Реклама", "59": "Услуги отправления"}\n```',
+            parse_mode="Markdown")
+        return
+    lines = ["📚 *Справочник начислений Ozon*", ""]
+    for tid, name in sorted(types.items(), key=lambda x: int(x[0]) if x[0].isdigit() else 0):
+        lines.append(f"  `{tid}` → {name}")
+    text = "\n".join(lines)
+    await send_long_message(update.message, text, parse_mode="Markdown")
+
 async def handle_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     chat_id = update.effective_chat.id
@@ -2331,9 +2519,11 @@ async def expense_types_cb(update, context):
         await q.edit_message_text("Главное меню:", reply_markup=None)
         await q.message.reply_text("Выберите действие:", reply_markup=main_kb(chat_id))
     elif d == "et_refresh":
-        global _expense_types_cache
+        global _expense_types_cache, _accrual_types_cache
         _expense_types_cache = _load_expense_types_sync()
-        await q.edit_message_text("🔄 Справочник перечитан.")
+        _accrual_types_cache = None
+        await fetch_accrual_types()
+        await q.edit_message_text("🔄 Справочник перечитан и обновлён.")
 
 async def send_help(update, context):
     chat_id = update.effective_chat.id
@@ -2367,7 +2557,8 @@ async def send_help(update, context):
             "• ➖ Удалить менеджера.\n"
             "• 📋 Список менеджеров.\n"
             "• 📚 Справочник расходов.\n"
-            "• /clearcache – сбросить кэш API (принудительное обновление данных).\n\n"
+            "• /accrual_types – справочник начислений Ozon.\n"
+            "• /clearcache – сбросить кэш API.\n\n"
             f"🤖 Версия бота: {VERSION}"
         )
     else:
@@ -3367,6 +3558,7 @@ def main():
     app.add_handler(CommandHandler("help", send_help))
     app.add_handler(CommandHandler("cancel", cancel))
     app.add_handler(CommandHandler("clearcache", clearcache_command))
+    app.add_handler(CommandHandler("accrual_types", accrual_types_command))
     app.add_handler(MessageHandler(filters.Regex(
         "^(📊 Отчёт по продажам|📦 Отчёт по товарам|📈 Отчёт по рекламе|"
         "🔔 Автоматические рассылки|⚙️ Администрирование|"
